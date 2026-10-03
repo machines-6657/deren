@@ -265,7 +265,7 @@ jobs:
           cmake --build build-asan --target
           test_app_config test_utility test_math test_animation test_gltf_loader test_toon_material_sidecar
           test_shadow_fit test_render_resources test_pass test_shader_sources test_meshlet test_goo_toon_math test_docs
-          test_dynamic_link
+          test_dynamic_link test_vulkan_capabilities test_texture_upload_layout
 
       - name: Run the headless tests under the sanitizers
         # ASAN_OPTIONS/UBSAN_OPTIONS: halt on the first finding and print a stack trace, so a report

@@ -1,5 +1,7 @@
 module;
 
+#include "texture_upload_layout.h"
+
 #include <vulkan/vulkan.h>
 #define VMA_IMPLEMENTATION
 #include <vma/vk_mem_alloc.h>
@@ -420,194 +422,6 @@ namespace deren::vulkan {
 } // namespace deren::vulkan
 
 namespace {
-    constexpr uint32_t sizeof_vk_format(VkFormat const format) {
-        switch (format) {
-        // 8-bit single channel
-        case VK_FORMAT_R8_UNORM:
-        case VK_FORMAT_R8_SNORM:
-        case VK_FORMAT_R8_USCALED:
-        case VK_FORMAT_R8_SSCALED:
-        case VK_FORMAT_R8_UINT:
-        case VK_FORMAT_R8_SINT:
-        case VK_FORMAT_R8_SRGB:
-            return 1;
-
-        // 16-bit single channel / 8-bit dual channel
-        case VK_FORMAT_R16_UNORM:
-        case VK_FORMAT_R16_SNORM:
-        case VK_FORMAT_R16_USCALED:
-        case VK_FORMAT_R16_SSCALED:
-        case VK_FORMAT_R16_UINT:
-        case VK_FORMAT_R16_SINT:
-        case VK_FORMAT_R16_SFLOAT:
-        case VK_FORMAT_R8G8_UNORM:
-        case VK_FORMAT_R8G8_SNORM:
-        case VK_FORMAT_R8G8_USCALED:
-        case VK_FORMAT_R8G8_SSCALED:
-        case VK_FORMAT_R8G8_UINT:
-        case VK_FORMAT_R8G8_SINT:
-        case VK_FORMAT_R8G8_SRGB:
-            return 2;
-
-        // 24-bit
-        case VK_FORMAT_R8G8B8_UNORM:
-        case VK_FORMAT_R8G8B8_SNORM:
-        case VK_FORMAT_R8G8B8_USCALED:
-        case VK_FORMAT_R8G8B8_SSCALED:
-        case VK_FORMAT_R8G8B8_UINT:
-        case VK_FORMAT_R8G8B8_SINT:
-        case VK_FORMAT_R8G8B8_SRGB:
-            return 3;
-
-        // 32-bit
-        case VK_FORMAT_R32_UINT:
-        case VK_FORMAT_R32_SINT:
-        case VK_FORMAT_R32_SFLOAT:
-        case VK_FORMAT_R16G16_UNORM:
-        case VK_FORMAT_R16G16_SNORM:
-        case VK_FORMAT_R16G16_USCALED:
-        case VK_FORMAT_R16G16_SSCALED:
-        case VK_FORMAT_R16G16_UINT:
-        case VK_FORMAT_R16G16_SINT:
-        case VK_FORMAT_R16G16_SFLOAT:
-        case VK_FORMAT_R8G8B8A8_UNORM:
-        case VK_FORMAT_R8G8B8A8_SNORM:
-        case VK_FORMAT_R8G8B8A8_USCALED:
-        case VK_FORMAT_R8G8B8A8_SSCALED:
-        case VK_FORMAT_R8G8B8A8_UINT:
-        case VK_FORMAT_R8G8B8A8_SINT:
-        case VK_FORMAT_R8G8B8A8_SRGB:
-        case VK_FORMAT_B8G8R8A8_UNORM:
-        case VK_FORMAT_B8G8R8A8_SNORM:
-        case VK_FORMAT_B8G8R8A8_USCALED:
-        case VK_FORMAT_B8G8R8A8_SSCALED:
-        case VK_FORMAT_B8G8R8A8_UINT:
-        case VK_FORMAT_B8G8R8A8_SINT:
-        case VK_FORMAT_B8G8R8A8_SRGB:
-        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
-        case VK_FORMAT_A2B10G10R10_UINT_PACK32:
-        case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
-        case VK_FORMAT_A2R10G10B10_UINT_PACK32:
-            return 4;
-
-        // 64-bit
-        case VK_FORMAT_R64_UINT:
-        case VK_FORMAT_R64_SINT:
-        case VK_FORMAT_R64_SFLOAT:
-        case VK_FORMAT_R32G32_UINT:
-        case VK_FORMAT_R32G32_SINT:
-        case VK_FORMAT_R32G32_SFLOAT:
-        case VK_FORMAT_R16G16B16A16_UNORM:
-        case VK_FORMAT_R16G16B16A16_SNORM:
-        case VK_FORMAT_R16G16B16A16_USCALED:
-        case VK_FORMAT_R16G16B16A16_SSCALED:
-        case VK_FORMAT_R16G16B16A16_UINT:
-        case VK_FORMAT_R16G16B16A16_SINT:
-        case VK_FORMAT_R16G16B16A16_SFLOAT:
-            return 8;
-
-        // 96-bit
-        case VK_FORMAT_R32G32B32_UINT:
-        case VK_FORMAT_R32G32B32_SINT:
-        case VK_FORMAT_R32G32B32_SFLOAT:
-            return 12;
-
-        // 128-bit
-        case VK_FORMAT_R64G64_UINT:
-        case VK_FORMAT_R64G64_SINT:
-        case VK_FORMAT_R64G64_SFLOAT:
-        case VK_FORMAT_R32G32B32A32_UINT:
-        case VK_FORMAT_R32G32B32A32_SINT:
-        case VK_FORMAT_R32G32B32A32_SFLOAT:
-            return 16;
-
-        // Depth/stencil
-        case VK_FORMAT_D16_UNORM:
-            return 2;
-        case VK_FORMAT_X8_D24_UNORM_PACK32:
-        case VK_FORMAT_D24_UNORM_S8_UINT:
-        case VK_FORMAT_D32_SFLOAT:
-            return 4;
-        case VK_FORMAT_D32_SFLOAT_S8_UINT:
-            return 8;
-        // Stencil-only: one byte per texel. It used to fall through into the BC1 group below and be
-        // reported as 8.
-        case VK_FORMAT_S8_UINT:
-            return 1;
-
-        // BC compressed formats
-        case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
-        case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
-        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-        case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-            return 8;
-
-        case VK_FORMAT_BC2_UNORM_BLOCK:
-        case VK_FORMAT_BC2_SRGB_BLOCK:
-        case VK_FORMAT_BC3_UNORM_BLOCK:
-        case VK_FORMAT_BC3_SRGB_BLOCK:
-        case VK_FORMAT_BC4_UNORM_BLOCK:
-        case VK_FORMAT_BC4_SNORM_BLOCK:
-        case VK_FORMAT_BC5_UNORM_BLOCK:
-        case VK_FORMAT_BC5_SNORM_BLOCK:
-        case VK_FORMAT_BC6H_UFLOAT_BLOCK:
-        case VK_FORMAT_BC6H_SFLOAT_BLOCK:
-        case VK_FORMAT_BC7_UNORM_BLOCK:
-        case VK_FORMAT_BC7_SRGB_BLOCK:
-        // ASTC compressed formats (all are 16 bytes/block)
-        case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_5x4_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_5x4_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_5x5_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_5x5_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_6x5_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_6x5_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_8x5_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_8x5_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_8x6_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_8x6_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_8x8_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_10x5_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_10x5_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_10x6_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_10x6_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_10x8_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_10x8_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_10x10_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_10x10_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_12x10_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_12x10_SRGB_BLOCK:
-        case VK_FORMAT_ASTC_12x12_UNORM_BLOCK:
-        case VK_FORMAT_ASTC_12x12_SRGB_BLOCK:
-            return 16;
-
-        // ETC2 / EAC compressed formats (8 bytes/block)
-        case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
-        case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
-        case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
-        case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
-        case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
-        case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
-        case VK_FORMAT_EAC_R11_UNORM_BLOCK:
-        case VK_FORMAT_EAC_R11_SNORM_BLOCK:
-        case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
-        case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
-            return 8;
-
-        default:
-            // Deliberately not 0: a 0 would zero every mip's host pointer offset in host_image_upload()
-            // and make the size check below compare against nothing, i.e. a silently wrong upload
-            // (or a meaningless region layout) instead of a failure. Every format this engine uploads
-            // is listed above, so a miss here is a bug in the table, not a caller error.
-            deren::utility::error("sizeof_vk_format: unsupported VkFormat {}", static_cast<int32_t>(format));
-            deren::utility::panic("sizeof_vk_format: unsupported VkFormat");
-        }
-    }
-
     constexpr VmaAllocationCreateInfo get_allocation_info_from_type(deren::vulkan::buffer_type const type) {
         VmaAllocationCreateInfo info = {};
         switch (type) {
@@ -1095,6 +909,13 @@ namespace deren::vulkan {
             return true; // an empty image (a shadow map or a target that is only rendered into) has no payload
         }
 
+        // 在形成指针和录制 barrier 前拒绝非法布局与短数据，避免偏移越界。
+        auto const required_size = detail::packed_image_size(info.format, info.width, info.height, info.array_layers, info.mip_levels);
+        if (!required_size || *required_size > size) {
+            deren::utility::error("Invalid or undersized host image upload layout");
+            return false;
+        }
+
         std::pair<VkCommandPool, VkCommandBuffer> command_pair;
         VkFence fence = VK_NULL_HANDLE;
         {
@@ -1164,7 +985,6 @@ namespace deren::vulkan {
         // Step 2: the copy itself, one region per mip. The data is laid out in mip-major order (all layers
         // of mip 0, then all layers of mip 1, ...) exactly as the staging path's VkBufferImageCopy
         // described it with bufferOffset; here the same offset is a POINTER into the caller's memory.
-        uint32_t const bytes_per_pixel = sizeof_vk_format(info.format);
         std::vector<VkMemoryToImageCopyEXT> regions;
         regions.reserve(info.mip_levels);
         VkDeviceSize memory_offset = 0;
@@ -1186,7 +1006,7 @@ namespace deren::vulkan {
             region.imageExtent = {mip_width, mip_height, 1};
             regions.push_back(region);
 
-            memory_offset += static_cast<VkDeviceSize>(mip_width) * mip_height * info.array_layers * bytes_per_pixel;
+            memory_offset += *detail::packed_mip_size(info.format, mip_width, mip_height, info.array_layers);
         }
         if (memory_offset > size) {
             // The caller already refuses a short payload (see create_image's expected-size check); this is
@@ -1351,17 +1171,15 @@ namespace deren::vulkan {
 
         VkDeviceSize const image_size = size_byte;
 
-        // Expected size = array_layers * sum of all mip sizes * bytes per pixel; only meaningful
-        // for images that carry uploaded data (empty render-target images have no payload), which is
-        // why the whole computation - format lookup included - is skipped for them.
+        // 压缩格式按块计数；总大小与 host copy 的逐 mip 偏移使用同一算法。
         if (data != nullptr) {
-            VkDeviceSize expected_size = 0;
-            for (uint32_t mip = 0; mip < create_info.mip_levels; ++mip) {
-                expected_size += static_cast<VkDeviceSize>(std::max(1u, create_info.width >> mip)) *
-                                 std::max(1u, create_info.height >> mip) *
-                                 sizeof_vk_format(create_info.format);
+            auto const packed_size = detail::packed_image_size(create_info.format, create_info.width, create_info.height, create_info.array_layers, create_info.mip_levels);
+            if (!packed_size) {
+                deren::utility::error("Invalid or overflowing image upload layout (format {})", static_cast<int32_t>(create_info.format));
+                this->recycle(handle);
+                return vk_image{};
             }
-            expected_size *= create_info.array_layers;
+            VkDeviceSize const expected_size = *packed_size;
             if (expected_size > image_size) {
                 // REFUSE, rather than log and carry on. host_image_upload() below lays the per-mip
                 // regions out from `expected_size` (the pointer-offset accumulation) while the caller's

@@ -256,6 +256,30 @@ export struct device_capabilities {
      */
     void query(VkPhysicalDevice physical_device, uint32_t api_version = VK_API_VERSION_1_3) noexcept;
 
+    // 选卡和创建设备共用同一份强制能力检查，避免选中不能启动渲染器的 GPU。
+    [[nodiscard]] std::vector<char const*> renderer_missing_requirements() const {
+        std::vector<char const*> missing;
+        if (features_1_3.dynamicRendering != VK_TRUE) {
+            missing.push_back("dynamicRendering (Vulkan 1.3)");
+        }
+        if (!descriptor_heap_available) {
+            missing.push_back("VK_EXT_descriptor_heap and its dependency");
+        }
+        if (!untyped_pointers_available) {
+            missing.push_back("VK_KHR_shader_untyped_pointers: shaderUntypedPointers");
+        }
+        if (!unified_image_layouts_available) {
+            missing.push_back("VK_KHR_unified_image_layouts: unifiedImageLayouts");
+        }
+        if (!host_image_copy_available) {
+            missing.push_back("VK_EXT_host_image_copy: hostImageCopy and GENERAL source layout");
+        }
+        if (!host_image_copy_upload_available) {
+            missing.push_back("VK_EXT_host_image_copy: GENERAL destination layout");
+        }
+        return missing;
+    }
+
     /**
      * @brief pNext chain head for vkCreateDevice (enables the queried features)
      */
@@ -553,9 +577,7 @@ void device_capabilities::query(VkPhysicalDevice const physical_device, uint32_t
     // unlike the heap and mesh shaders there is no shader-side consumer to gate - the whole renderer is written
     // against GENERAL, and a device without the feature is rejected at device creation (core.constructor).
     bool const unified_image_layouts_extension = has_extension(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
-    // VK_EXT_host_image_copy, an INDEPENDENT and OPTIONAL extension: it adds a host-side copy path (no command
-    // buffer, no staging buffer), but this renderer has a working fallback, so unlike the feature above its
-    // absence is a slower read-back rather than a device-creation refusal.
+    // Host image copy is independent of the other extensions and mandatory for renderer-owned uploads/read-back.
     bool const host_image_copy_extension = has_extension(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
 
     // ---- Feature pNext chain: features_2 -> 1_1 -> 1_2 -> 1_3 -> 1_4 (truncated by api_version),
@@ -598,6 +620,11 @@ void device_capabilities::query(VkPhysicalDevice const physical_device, uint32_t
         independent_tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&descriptor_heap_features);
         independent_tail = reinterpret_cast<VkBaseOutStructure*>(&descriptor_heap_features);
     }
+    // 堆着色器的依赖独立追加；不能挂在可选光追/micromap 节点后面。
+    if (untyped_pointers_extension) {
+        independent_tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&untyped_pointers_features);
+        independent_tail = reinterpret_cast<VkBaseOutStructure*>(&untyped_pointers_features);
+    }
     if (mesh_shader_extension) {
         independent_tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&mesh_shader_features);
         independent_tail = reinterpret_cast<VkBaseOutStructure*>(&mesh_shader_features);
@@ -618,8 +645,7 @@ void device_capabilities::query(VkPhysicalDevice const physical_device, uint32_t
     ray_query_features.pNext = ray_tracing_pipeline_extensions ? reinterpret_cast<VkBaseOutStructure*>(&ray_tracing_pipeline_features) : nullptr;
     ray_tracing_pipeline_features.pNext = ray_tracing_pipeline_extensions ? &ray_tracing_maintenance1_features : nullptr;
     ray_tracing_maintenance1_features.pNext = opacity_micromap_extension ? reinterpret_cast<VkBaseOutStructure*>(&opacity_micromap_features) : nullptr;
-    opacity_micromap_features.pNext = untyped_pointers_extension ? reinterpret_cast<VkBaseOutStructure*>(&untyped_pointers_features) : nullptr;
-    untyped_pointers_features.pNext = nullptr;
+    opacity_micromap_features.pNext = nullptr;
     vkGetPhysicalDeviceFeatures2(physical_device, &features_2);
 
     // Both feature bits have to be true for the two structs to be worth keeping in the chain: the
@@ -684,16 +710,23 @@ void device_capabilities::query(VkPhysicalDevice const physical_device, uint32_t
     host_image_copy_properties.copySrcLayoutCount = static_cast<uint32_t>(host_image_copy_src_layouts.size());
     host_image_copy_properties.pCopyDstLayouts = host_image_copy_dst_layouts.data();
     host_image_copy_properties.copyDstLayoutCount = static_cast<uint32_t>(host_image_copy_dst_layouts.size());
-    maintenance4_properties.pNext = host_image_copy_extension ? reinterpret_cast<VkBaseOutStructure*>(&host_image_copy_properties) : nullptr;
-    host_image_copy_properties.pNext = descriptor_heap_extension ? reinterpret_cast<VkBaseOutStructure*>(&descriptor_heap_properties) : nullptr;
-    // The mesh shader limits are queried on extension PRESENCE rather than availability: the printout must be
-    // able to say what the device offers even when the feature is off, which is exactly the case the "of 0"
-    // failure above came from (the PROPERTIES are zero then, and only the QUERY is honest about it).
-    descriptor_heap_properties.pNext = mesh_shader_extension ? reinterpret_cast<VkBaseOutStructure*>(&mesh_shader_properties) : nullptr;
-    mesh_shader_properties.pNext = ray_query_available ? &acceleration_structure_properties : nullptr;
-    acceleration_structure_properties.pNext = opacity_micromap_available ? reinterpret_cast<VkBaseOutStructure*>(&opacity_micromap_properties) : nullptr;
-    opacity_micromap_properties.pNext = ray_tracing_pipeline_available ? reinterpret_cast<VkBaseOutStructure*>(&ray_tracing_pipeline_properties) : nullptr;
-    ray_tracing_pipeline_properties.pNext = nullptr;
+    // 每项属性按自身条件接到尾部，缺少前一个可选扩展不能截断后续查询。
+    {
+        auto* tail = reinterpret_cast<VkBaseOutStructure*>(&maintenance4_properties);
+        auto const link = [&tail](bool const present, void* node) {
+            if (present) {
+                tail->pNext = static_cast<VkBaseOutStructure*>(node);
+                tail = static_cast<VkBaseOutStructure*>(node);
+            }
+        };
+        link(host_image_copy_extension, &host_image_copy_properties);
+        link(descriptor_heap_extension, &descriptor_heap_properties);
+        link(mesh_shader_extension, &mesh_shader_properties);
+        link(ray_query_available, &acceleration_structure_properties);
+        link(opacity_micromap_available, &opacity_micromap_properties);
+        link(ray_tracing_pipeline_available, &ray_tracing_pipeline_properties);
+        tail->pNext = nullptr;
+    }
     vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
 
     // ---- The rest of the host-image-copy capability, in BOTH directions. The feature bit promises the entry
@@ -1188,17 +1221,17 @@ VkPhysicalDevice pick_suitable_device(VkInstance instance, VkSurfaceKHR surface)
 
     for (auto const& device : devices) {
         VkPhysicalDeviceProperties device_properties;
-        VkPhysicalDeviceFeatures device_features;
         vkGetPhysicalDeviceProperties(device, &device_properties);
-        vkGetPhysicalDeviceFeatures(device, &device_features);
 
         // The engine requires Vulkan 1.3: dynamic rendering (frame recording, the depth-only
         // shadow pass, the ImGui overlay) is core 1.3 - there is no classic render-pass fallback.
         if (device_properties.apiVersion < VK_API_VERSION_1_3) {
+            deren::utility::error("GPU [{}] rejected: Vulkan 1.3 required", device_properties.deviceName);
             continue;
         }
 
         if (queue_family_indices indices = find_queue_families(device, surface); !indices.is_complete()) {
+            deren::utility::error("GPU [{}] rejected: graphics/present queues required", device_properties.deviceName);
             continue;
         }
 
@@ -1207,13 +1240,24 @@ VkPhysicalDevice pick_suitable_device(VkInstance instance, VkSurfaceKHR surface)
             VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         };
         if (!check_device_extension_support(device, required_extensions)) {
+            deren::utility::error("GPU [{}] rejected: VK_KHR_swapchain required", device_properties.deviceName);
+            continue;
+        }
+
+        device_capabilities capabilities;
+        capabilities.query(device);
+        auto const missing = capabilities.renderer_missing_requirements();
+        if (!missing.empty()) {
+            for (char const* requirement : missing) {
+                deren::utility::error("GPU [{}] rejected: {} required", device_properties.deviceName, requirement);
+            }
             continue;
         }
 
         return device; // suitable device found
     }
 
-    deren::utility::panic("Failed to find a suitable GPU (Vulkan 1.3 required)!");
+    deren::utility::panic("Failed to find a GPU satisfying renderer requirements; see per-device missing capabilities");
 }
 
 swap_chain_support_details query_swap_chain_support(VkPhysicalDevice device, VkSurfaceKHR surface) noexcept {

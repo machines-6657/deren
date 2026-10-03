@@ -542,12 +542,13 @@ namespace deren::vulkan {
         // decisions like the GPU pass timings) - the capabilities query already fetched them
         this->device_properties = capabilities.properties_2.properties;
 
-        // Dynamic rendering (Vulkan 1.3 core) is mandatory: pick_suitable_device only accepts
-        // apiVersion >= 1.3 devices, and frames always record through vkCmdBeginRendering - no
-        // render pass / framebuffer objects exist. Double-check the feature bit anyway (a
-        // conformant 1.3 driver must expose it).
-        if (capabilities.features_1_3.dynamicRendering != VK_TRUE) {
-            deren::utility::panic("dynamic rendering (Vulkan 1.3) is required but not supported by the device");
+        // 与选卡共用检查，尤其保证 descriptor heap 的着色器依赖也可用。
+        auto const missing = capabilities.renderer_missing_requirements();
+        if (!missing.empty()) {
+            for (char const* requirement : missing) {
+                deren::utility::error("Selected GPU is missing required capability: {}", requirement);
+            }
+            deren::utility::panic("Selected GPU no longer satisfies renderer requirements");
         }
 
         device_creation_info creation_info;
@@ -610,9 +611,7 @@ namespace deren::vulkan {
             // ... and the heap's shaders' own dependency, without which no `descriptor_heap` declaration can be
             // turned into a shader module at all (see the capability layer): the extension whose SPIR-V declares
             // untyped pointers.
-            if (capabilities.untyped_pointers_dependency != nullptr) {
-                creation_info.extensions.push_back(capabilities.untyped_pointers_dependency);
-            }
+            creation_info.extensions.push_back(capabilities.untyped_pointers_dependency);
             creation_info.extensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
         }
         // ... and mesh shaders, the other independent extension: it replaces the VERTEX stage with a MESH
@@ -625,34 +624,12 @@ namespace deren::vulkan {
         if (capabilities.mesh_shader_available) {
             creation_info.extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
         }
-        // ... and unified image layouts, the ONE extension here that is not optional. The renderer keeps every
-        // image in VK_IMAGE_LAYOUT_GENERAL and performs no per-layout transitions at all, so a device without
-        // the feature would run against assumptions that are simply false - it is refused rather than degraded.
-        // The name is pushed regardless of the flag so that "the extension is enabled" and "its feature struct
-        // is in the pNext chain" can never disagree (the chain only carries it when it is available, and the
-        // check below is what decides whether we get that far). No dependency name goes with it:
-        // VK_KHR_unified_image_layouts needs VK_KHR_get_physical_device_properties2 and VK_VERSION_1_1, and the
-        // 1.3 device this renderer creates satisfies both. It adds no commands either.
+        // GENERAL 布局是强制要求，上面的共用检查已确认扩展与功能均可用。
         creation_info.extensions.push_back(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
-        if (!capabilities.unified_image_layouts_available) {
-            deren::utility::panic("VK_KHR_unified_image_layouts is required but not supported by the device");
-        }
 
-        // VK_EXT_host_image_copy is the SECOND non-optional extension here, the opposite of what it used to be:
-        // the images this renderer creates for itself are uploaded with `vkCopyMemoryToImageEXT` and read back
-        // with `vkCopyImageToMemoryEXT` (the heap probe, and the texture-upload path), so a device without it
-        // would run against assumptions that are simply false - it is refused, not degraded. The name is pushed
-        // REGARDLESS of the flag, exactly like the layout feature above, so "the extension is enabled" and "its
-        // feature struct is in the pNext chain" can never disagree; the checks below decide whether startup
-        // continues. (The SWAPCHAIN read-back is a separate case and NOT part of this requirement: a swapchain
-        // image cannot carry HOST_TRANSFER, so that read-back uses the copy command - see init_swap_chain.)
+        // 自有图像上传/读回同样要求 host image copy，GENERAL 的两个方向均已检查。
+        // Swapchain 读回仍使用 copy command，因为其图像没有 HOST_TRANSFER usage。
         creation_info.extensions.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
-        if (!capabilities.host_image_copy_available) {
-            deren::utility::panic("VK_EXT_host_image_copy is required (image upload and read-back) but not usable on this device");
-        }
-        if (!capabilities.host_image_copy_upload_available) {
-            deren::utility::panic("VK_EXT_host_image_copy is present but GENERAL is not in the device's copy-DESTINATION layout list, so vkCopyMemoryToImageEXT is unusable");
-        }
 
         if (!check_device_extension_support(physical_device, creation_info.extensions)) {
             deren::utility::panic("Required device extensions not supported");
