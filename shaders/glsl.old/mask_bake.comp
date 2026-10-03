@@ -1,0 +1,215 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// The bindless texture array is indexed by the material's own index, exactly as shaders/surface.glsl does
+// it: plain indices into a partially-bound array.
+#extension GL_EXT_nonuniform_qualifier : enable
+
+/**
+ * @file shaders/mask_bake.comp
+ * @brief Bake alphaMode MASK into the geometry an acceleration structure is built from: collapse a
+ *        triangle whose WHOLE AREA the mask cuts out, in an expanded copy of the vertices.
+ * @ingroup shaders
+ *
+ * WHY THIS EXISTS, AND WHAT REPLACED IT. An inline ray query has no any-hit stage, so a MASK material's
+ * `discard` cannot run during traversal and the surface is SOLID to every ray: the raster shadow pass cuts the
+ * material's holes and a ray-traced one does not, which is a difference a user sees. This pass is the answer
+ * that was available while the shadow ran on a ray QUERY: resolve the mask BEFORE the build - evaluate the
+ * material's alpha over a triangle, write the result into a vertex buffer, and build the structure from that
+ * buffer.
+ *
+ * THE SHADOW NO LONGER RUNS ON A RAY QUERY, so this is the OLD ARM of an A/B rather than the mechanism: a
+ * ray-tracing pipeline's any-hit shader (`shaders/rt_shadow.rahit`) decides the same question PER HIT instead
+ * of per triangle, which is strictly finer - a triangle cannot represent a per-pixel mask, and this pass was
+ * measured landing 1.29 of mean brightness away from the raster reference because of exactly that. It stays
+ * because a switch is what makes the two comparable, and it is off by default (`[render] rt_mask_bake`).
+ *
+ * Hiding a triangle means writing all three of its vertices at the SAME position - a degenerate triangle,
+ * which traversal can never report a hit against. That is only safe when the triangle OWNS its vertices: a
+ * shared vertex would drag its neighbours with it. So the geometry is EXPANDED - three unique vertices per
+ * triangle, no index buffer - into the buffer this pass fills, and the instance table points at that buffer
+ * instead of the original one. A zero index address marks the geometry as not indexed.
+ *
+ * THE RULE IS "THE WHOLE TRIANGLE IS CUT", sampled on a grid over the triangle's AREA - not at its
+ * vertices. Vertex sampling is cheaper and wrong in a way that REMOVES VISIBLE GEOMETRY: a quad whose mask
+ * has an opaque shape in its middle samples transparent at all four corners, so it looks entirely cut while
+ * it is the very thing that should cast the shadow. That is not a hypothetical: the sample assets'
+ * two-quad MASK planes measure 100% "cut" by their vertices and 0% cut over their area, while the assets
+ * made of many small cards (a plant, a vase of flowers) have 14% and 40% of their triangles genuinely empty.
+ * The grid costs a handful of texture fetches per triangle in a pass that runs ONCE per structure.
+ *
+ * WHAT IT DOES NOT DO, because the limit belongs to the mechanism and not to this code: a triangle that is
+ * PARTLY cut stays entirely solid, since an acceleration structure holds triangles and nothing finer.
+ * Per-pixel holes inside a triangle need a different mechanism - subdividing along the mask boundary, or
+ * the opacity-micromap extension - and this pass does not pretend to have one. What it removes is the
+ * triangles that are wholly empty, and it leaves every other triangle exactly as it found it.
+ */
+
+layout(local_size_x = 64) in;
+
+// HEAP-NATIVE (see docs/descriptor_heap_migration.md): the material table and the bindless texture array are heap
+// descriptors now, declared here rather than included from surface.glsl because that file also declares the shared
+// push-constant block and a shader may declare only one. The extensions are required in every stage that declares a
+// `descriptor_heap` resource, and the grid header brings the slots and the shared arrays.
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#include "heap_slots.glsl"
+struct MaskMaterial {
+    uvec4 tex_indices; // albedo, metallic-roughness, normal, occlusion (indices into textures[])
+    uint emissive_index;
+    float alpha_cutoff;
+    float occlusion_strength;
+    uint _pad;
+    vec4 base_color_factor;
+    vec4 emissive_factor;
+    float metallic_factor;
+    float roughness_factor;
+    float normal_scale;
+    uint flags; // bit4: alphaMode MASK - the bit that makes this pass meaningful for a material
+};
+// The ARRAY name carries the HEAP slot, the block member carries the record index: two index spaces.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) readonly buffer MaskMaterials { MaskMaterial materials[]; } heap_material_tables[];
+
+layout(push_constant) uniform MaskBakePush {
+    // Device addresses as two 32-bit halves, the shape every pass in this project pushes them in (a push
+    // constant is raw bytes, so a lane holds an address's half exactly as written).
+    uvec2 source_vertices;
+    uvec2 source_indices; // zero when the source geometry is not indexed
+    uvec2 destination;
+    uint source_stride;
+    uint destination_stride;
+    uint index_type; // VkIndexType: 0 = uint16, 1 = uint32 (ignored when source_indices is zero)
+    uint triangle_count;
+    uint material_index;
+} pc;
+
+// The source vertices are read as untyped 4-byte words: the engine's vertex is an implementation-defined
+// interleaved record, so addressing it as floats is what makes the offsets (0, 3, 6) read
+// `vec3 position; vec3 normal; vec2 uv` without depending on a std430 layout that does not exist.
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SourceFloats {
+    float values[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SourceWords {
+    uint values[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer DestFloats {
+    float values[];
+};
+
+/** @brief the most samples per UV axis one triangle's footprint is walked at (a larger footprint is KEPT) */
+#define MASK_BAKE_MAX_STEPS 64
+
+/** @brief the 64-bit device address held in two push lanes
+ *  @note the parameter's qualifier is LEADING: glslc rejects a trailing `const` on a declaration
+ *        (`float const x`), which shaders/fxaa.frag already records and this file re-learned */
+uint64_t lane_address(uvec2 halves) {
+    return (uint64_t(halves.y) << 32u) | uint64_t(halves.x);
+}
+
+void main() {
+    const uint triangle = gl_GlobalInvocationID.x;
+    if (triangle >= pc.triangle_count) {
+        return; // the dispatch is rounded up to the workgroup size
+    }
+
+    // The triangle's three source vertices, by the same arithmetic the hit shader uses: an index (or, for
+    // a non-indexed source, the vertex's own position in the list), times the stride, off the base.
+    SourceWords indices = SourceWords(lane_address(pc.source_indices));
+    SourceFloats vertices = SourceFloats(lane_address(pc.source_vertices));
+    const uint stride = pc.source_stride / 4u;
+    vec3 positions[3];
+    vec3 normals[3];
+    vec2 uvs[3];
+    for (uint k = 0u; k < 3u; ++k) {
+        const uint i = triangle * 3u + k;
+        uint vertex = i;
+        if (pc.source_indices != uvec2(0u)) {
+            // VkIndexType: UINT16 is 0 and UINT32 is 1.
+            if (pc.index_type == 0u) {
+                const uint word = indices.values[i >> 1u];
+                vertex = (i & 1u) == 0u ? (word & 0xFFFFu) : (word >> 16u);
+            } else {
+                vertex = indices.values[i];
+            }
+        }
+        const uint at = vertex * stride;
+        positions[k] = vec3(vertices.values[at + 0u], vertices.values[at + 1u], vertices.values[at + 2u]);
+        normals[k] = vec3(vertices.values[at + 3u], vertices.values[at + 4u], vertices.values[at + 5u]);
+        uvs[k] = vec2(vertices.values[at + 6u], vertices.values[at + 7u]);
+    }
+
+    // The area test: the triangle is collapsed only when EVERY texel of its UV footprint is cut - so it
+    // survives as soon as ONE texel inside its UV triangle is opaque.
+    //
+    // THE SAMPLES WALK THE FOOTPRINT AT TEXTURE RESOLUTION, and that is the part the measurement decided: a
+    // fixed sample grid does NOT scale with the triangle's texel area, so it misses exactly the small
+    // opaque islands a MASK texture is made of, and every miss deletes geometry the raster path keeps (which
+    // shows up as a shadow that stops being cast). Measured on the sample assets: a 10-sample triangular
+    // grid over the area cut 1.0% of a vase's triangles where a texel walk over the same area cut 0.1%, and
+    // the vase's frame came out 1.42 of mean brightness BRIGHTER than the raster shadow it should match -
+    // i.e. nine of every ten of the cheap rule's decisions removed a shadow that belongs there.
+    const MaskMaterial material = heap_material_tables[heap_slots_materials].materials[pc.material_index];
+    const float cutoff = material.alpha_cutoff;
+    const float factor_alpha = material.base_color_factor.a;
+    const vec2 uv_min = min(min(uvs[0], uvs[1]), uvs[2]);
+    const vec2 uv_max = max(max(uvs[0], uvs[1]), uvs[2]);
+    const vec2 uv_span = uv_max - uv_min;
+    const ivec2 footprint = ivec2(abs(uv_span) * vec2(textureSize(sampler2D(heap_textures[heap_slots_textures + material.tex_indices.x], heap_samplers[heap_sampler_texture]), 0)));
+    // The cap is spent on the SAFE side: a footprint too large to walk (a triangle spanning a whole sheet or
+    // crossing a UV wrap) is KEPT, so the bake never removes geometry it has not looked at.
+    const int steps_u = max(1, min(footprint.x, MASK_BAKE_MAX_STEPS));
+    const int steps_v = max(1, min(footprint.y, MASK_BAKE_MAX_STEPS));
+    bool any_opaque = footprint.x > MASK_BAKE_MAX_STEPS || footprint.y > MASK_BAKE_MAX_STEPS;
+    for (int iu = 0; iu < steps_u && !any_opaque; ++iu) {
+        for (int iv = 0; iv < steps_v && !any_opaque; ++iv) {
+            // The sample grid covers the UV BOUNDING BOX, so a sample outside the triangle has to be
+            // skipped: the box is not the triangle, and its corners belong to whatever else shares the
+            // texture atlas.
+            const vec2 uv = uv_min + (vec2(float(iu), float(iv)) + vec2(0.5)) / vec2(float(steps_u), float(steps_v)) * uv_span;
+            const vec2 e0 = uvs[1] - uvs[0];
+            const vec2 e1 = uvs[2] - uvs[0];
+            const float determinant = e0.x * e1.y - e1.x * e0.y;
+            if (abs(determinant) < 1e-12) {
+                any_opaque = true; // a degenerate UV triangle: keep it, nothing can be decided about it
+                break;
+            }
+            const vec2 rel = uv - uvs[0];
+            const float w1 = (rel.x * e1.y - e1.x * rel.y) / determinant;
+            const float w2 = (e0.x * rel.y - rel.x * e0.y) / determinant;
+            const float w0 = 1.0 - w1 - w2;
+            if (min(min(w0, w1), w2) < -0.01) {
+                continue; // outside the triangle (the tolerance absorbs the grid's own rounding)
+            }
+            // The same coverage the raster path tests: base colour factor alpha times the texture's alpha,
+            // kept when it reaches the cutoff (shaders/shadow.frag and surface.glsl's `alpha < cutoff ->
+            // discard`). The sampler is indexed inline: GLSL lets a sampler live only in a uniform or a
+            // parameter, not in a local.
+            const float coverage = factor_alpha * heap_texel(heap_textures[heap_slots_textures + material.tex_indices.x], heap_sampler_texture, uv).a;
+            any_opaque = coverage >= cutoff;
+        }
+    }
+
+    // Write the three destination vertices: the source's own when the triangle survives, and three copies
+    // of its FIRST vertex when it does not - which is a degenerate triangle, and the whole of what "hide
+    // this triangle" means to an acceleration structure.
+    //
+    // Position, normal AND UV are copied in both cases. The UVs are what the hit shading interpolates to
+    // sample the material, and the normal is what it uses when the material has no normal map (a hit WITH
+    // one solves its tangent frame from the triangle's own edges and UV deltas, and needs the vertex normal
+    // as that frame's third axis) - so a zeroed normal would not be "unused", it would be a degenerate
+    // shading frame. For a hidden triangle none of the three is ever read: no ray can hit it.
+    DestFloats out_values = DestFloats(lane_address(pc.destination));
+    const uint destination_stride = pc.destination_stride / 4u;
+    for (uint k = 0u; k < 3u; ++k) {
+        const uint source = any_opaque ? k : 0u;
+        const uint at = (triangle * 3u + k) * destination_stride;
+        out_values.values[at + 0u] = positions[source].x;
+        out_values.values[at + 1u] = positions[source].y;
+        out_values.values[at + 2u] = positions[source].z;
+        out_values.values[at + 3u] = normals[source].x;
+        out_values.values[at + 4u] = normals[source].y;
+        out_values.values[at + 5u] = normals[source].z;
+        out_values.values[at + 6u] = uvs[source].x;
+        out_values.values[at + 7u] = uvs[source].y;
+    }
+}

@@ -1,0 +1,35 @@
+#clion folders
+cmake-build-*/
+build-*-clang64/
+build-debug/
+build-release/
+#sanitizer build (ASan/UBSan, local verification only - see tests/)
+build-asan/
+.idea/
+
+#doxygen generated output
+docs/html/
+docs/latex/
+
+#compiled shaders: the build produces them (into <build>/shaders), so they are never committed and
+#never hand-synced with their .glsl sources - editing a shader and rebuilding is the whole workflow
+*.spv
+
+#runtime artifacts (flushed logs; the Dear ImGui layout file is no longer written - io.IniFilename is null - but it stays ignored so a stale one cannot be committed)
+debug.log
+debug.log.old
+imgui_layout.ini
+# MSVC writes a compiler PDB next to the target when the link line leaves /Fd implied (vc140.pdb in
+# the repository root, in practice) - generated output, never a source file
+*.pdb
+#local startup config (generated from config.example.toml by the setup scripts)
+config.toml
+.commit-msg.tmp
+
+# A plain out-of-source build directory (cmake -B build): not part of the repository, same as the
+# per-configuration ones above. Found tracked once by accident, via compile_commands.json.
+/build/
+
+# python bytecode from the project's own tools
+__pycache__/
+*.pyc

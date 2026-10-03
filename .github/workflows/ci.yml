@@ -1,0 +1,280 @@
+name: ci
+
+# Build + headless tests on every push to master and every pull request.
+#
+# Why MSYS2 clang64: the project is C++23 modules on clang + libc++, and the
+# STL module (vstd/vstd.cppm, a trimmed fork of the generated libc++ std module)
+# is tied to that toolchain - the only environment that guarantees a
+# byte-compatible libc++ is the same MSYS2 clang64 the project is developed in. The headless unit tests
+# (tests/, ctest) run on the CPU-only modules; the Release build of the full
+# project (including the Vulkan executable) is the compile gate. No GPU is
+# needed - nothing is executed that requires a Vulkan device.
+#
+# Gates in one job (they share the MSYS2 install): Release build + ctest,
+# a Debug build (assert-enabled compile gate - catches paths Release skips),
+# and clang-tidy over the pure-CPU modules (app_config + utility), which is
+# kept warning-free so --warnings-as-errors fails on any regression.
+#
+# SLANGC IS THE ONLY SHADER COMPILER, AND IT IS REQUIRED: every shader stage in this project is built from a
+# .slang source, and CMakeLists REFUSES to configure without slangc (`find_program(VR_SLANGC_EXECUTABLE ...)`
+# followed by FATAL_ERROR) since the GLSL fallback and the GLSL stage sources were both removed. MSYS2 has no
+# slang package (`pacman -Ss slang` matches nothing, measured), so both jobs install the pinned upstream
+# release, verify its checksum, and then ASSERT that CMake found it (the configure step greps for the
+# `slangc:` line CMakeLists prints) - and `test_shader_sources` closes the other half of the same gap: it
+# compares the build's shader list against the two escape-hatch scripts and requires the MESH entries to be
+# there, so a shader the build compiles and the scripts do not (or a mesh stage that stops being built at all)
+# fails a job rather than a picture.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: Release build + ctest + Debug gate + clang-tidy
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up MSYS2 (clang64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: clang64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-clang-tools-extra
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-libc++
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-glfw
+            mingw-w64-clang-x86_64-glm
+            mingw-w64-clang-x86_64-tomlplusplus
+            mingw-w64-clang-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-shaderc
+
+      - name: Install slangc (pinned Slang release)
+        shell: pwsh
+        # MSYS2 ships no slang package, so the upstream release is fetched; the CHECKSUM IS VERIFIED before it
+        # is unpacked, and VR_SLANGC is exported for the configure step so the path is passed explicitly
+        # rather than rediscovered. Version and hash are pinned: bumping either is a deliberate change.
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/shader-slang/slang/releases/download/v2026.18.2/slang-2026.18.2-windows-x86_64.zip"
+          $sha = "747602aec6b3623658d55fea87492d71828e15d16802d7941204fde418ceee8e"
+          $zip = Join-Path $env:RUNNER_TEMP "slang.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $sha) { throw "slang zip checksum mismatch: expected $sha, got $actual" }
+          $dest = Join-Path $env:RUNNER_TEMP "slang"
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $slangc = Join-Path $dest "bin/slangc.exe"
+          if (-not (Test-Path $slangc)) { throw "slangc.exe is not where the release puts it: $slangc" }
+          & $slangc -version
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dest "bin")
+          Add-Content -Path $env:GITHUB_ENV -Value "VR_SLANGC=$slangc"
+
+      - name: Configure (Release, Ninja)
+        # VR_NATIVE_ARCH=OFF: this job UPLOADS the executable as an artifact, and -march=native would
+        # tune it for the runner's CPU - a binary that can SIGILL on an older machine, which is the
+        # opposite of what a single-file Release build is for. Local builds keep the native default.
+        #
+        # THE ASSERTION IS THE POINT OF THIS STEP'S SHAPE: CMakeLists prints a `slangc: <path> - <sources>`
+        # status line when it finds the compiler and silently builds the GLSL sources when it does not, so a
+        # configure whose output lacks that line would pass while testing the wrong shaders. Failing here is
+        # cheaper than discovering it from a shader bug that only reproduces on a developer's machine.
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DVR_NATIVE_ARCH=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DVR_SLANGC_EXECUTABLE="$VR_SLANGC" 2>&1 | tee configure.log
+          if ! grep -q "slangc:" configure.log; then
+            echo "CMake did NOT find slangc, so it would compile the GLSL sources of the ported stages."
+            exit 1
+          fi
+
+      - name: Build all targets (incl. tests + deren.exe)
+        run: cmake --build build
+
+      # README claims this target exists "for CI"; until now nothing called it, so a formatting
+      # regression could only be caught by a human noticing the next auto-format diff.
+      - name: clang-format (dry run, warnings are errors)
+        run: cmake --build build --target clang-format-check
+
+      - name: Run headless unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      # SLANGC IS PASSED EXPLICITLY HERE TOO, for exactly the reason the Release step does it: the install
+      # step exports VR_SLANGC but does NOT put it on PATH, so CMakeLists' `find_program` fails and configure
+      # stops with "slangc not found" - which kept this job red while every test in it would have passed. The
+      # two configure steps have the same requirement, so they now say the same thing.
+      - name: Configure (Debug, Ninja)
+        run: cmake -S . -B build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DVR_SLANGC_EXECUTABLE="$VR_SLANGC"
+
+      - name: Build all targets (Debug compile gate)
+        run: cmake --build build-debug
+
+      - name: clang-tidy (pure-CPU modules, warnings are errors)
+        run: |
+          # THE LIST IS CHECKED BEFORE IT IS USED. utility/thread_pool/thread_pool.cpp and
+          # utility/BVH/bvh.cpp sat in this list after the module renames moved them to .cppm, and
+          # clang-tidy's "no such file or directory" kept master red while every other gate passed.
+          # A hand-maintained list that can go stale silently is a failure mode of its own.
+          # app_config is the TARGET name; its sources live in application_configuration/ (the dir was
+          # renamed and this list was not).
+          TIDY_FILES="application_configuration/application_configuration.cppm \
+            application_configuration/application_configuration.cpp \
+            utility/data_block.cppm utility/utility.cppm utility/utility.cpp \
+            utility/thread_pool/thread_pool.cppm \
+            utility/BVH/bvh.cppm \
+            utility/frame_clock/frame_clock.cppm \
+            utility/frame_stats/frame_stats.cppm \
+            utility/better_pmr/better_pmr.cppm \
+            utility/dynamic_link.cppm \
+            promise/rhi/rhi.cppm \
+            promise/rhi/rhi.contract.cppm \
+            promise/rhi/rhi.extension.cppm \
+            promise/rhi/rhi.api_core.cppm"
+          for f in $TIDY_FILES; do
+            if [ ! -f "$f" ]; then
+              echo "clang-tidy list names a file that does not exist: $f"
+              exit 1
+            fi
+          done
+          clang-tidy -p build --warnings-as-errors='*' $TIDY_FILES
+
+      - name: Upload the Release executable
+        uses: actions/upload-artifact@v5
+        with:
+          name: deren-windows-x64
+          path: build/deren.exe
+          if-no-files-found: error
+
+  sanitizers:
+    name: ASan + UBSan (headless tests)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up MSYS2 (clang64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: clang64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-compiler-rt
+            mingw-w64-clang-x86_64-libc++
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-glfw
+            mingw-w64-clang-x86_64-glm
+            mingw-w64-clang-x86_64-tomlplusplus
+            mingw-w64-clang-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-shaderc
+
+      # AddressSanitizer + UndefinedBehaviorSanitizer over the headless CPU tests.
+      #
+      # A separate job rather than another gate in build-and-test: this build cannot be shared with
+      # the optimized one (sanitizers need instrumentation and must not be LTO'd), and keeping it
+      # apart means a sanitizer finding does not hide the Release/Debug/clang-tidy result.
+      #
+      # Only the test targets are built, even though this job now installs everything the executable
+      # would need: the binary is never run here, so compiling and linking it under the sanitizers
+      # would cost minutes to produce an artifact nobody executes.
+      #
+      # glfw is not optional here, which is not obvious from "headless tests". deren.vulkan.math,
+      # deren.vulkan.animation and deren.vulkan.shadow_fit all live in vulkancorekit, whose PUBLIC link interface
+      # carries imgui - so building test_math / test_animation / test_shadow_fit compiles
+      # imgui_impl_glfw.cpp and a missing GLFW/glfw3.h fails the build before any test runs (measured:
+      # that is what turned this job red, not a sanitizer finding).
+      #
+      # The Vulkan packages are needed for two separate reasons: vulkancorekit links Vulkan::Vulkan as
+      # a PUBLIC dependency, and CMakeLists requires a shader compiler to compile the shaders even in a
+      # build that asks for test targets only - the requirement is checked at configure time (slangc; the
+      # glslc package stays installed because FindVulkan's shaderc search is what satisfies it here).
+      #
+      # Why this gate earns its place: the whole test suite is pure CPU with no GPU anywhere, so
+      # memory errors in the loader / utility / config paths are invisible to the Release run. The
+      # glTF reader's non-float-attribute bug is the worked example - four assertions deep in the
+      # vertex builder passed in Release while ASan reported
+      # "READ of size 8 ... 0 bytes after 6-byte region" on the same code.
+      - name: Install slangc (pinned Slang release)
+        shell: pwsh
+        # The same pinned release the build job uses, and for the same reason: this job also CONFIGURES the
+        # project, and CMakeLists compiles the shaders during the build - without slangc it would silently
+        # build the GLSL sources of the twenty-three ported stages instead.
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/shader-slang/slang/releases/download/v2026.18.2/slang-2026.18.2-windows-x86_64.zip"
+          $sha = "747602aec6b3623658d55fea87492d71828e15d16802d7941204fde418ceee8e"
+          $zip = Join-Path $env:RUNNER_TEMP "slang.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $sha) { throw "slang zip checksum mismatch: expected $sha, got $actual" }
+          $dest = Join-Path $env:RUNNER_TEMP "slang"
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $slangc = Join-Path $dest "bin/slangc.exe"
+          if (-not (Test-Path $slangc)) { throw "slangc.exe is not where the release puts it: $slangc" }
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dest "bin")
+          Add-Content -Path $env:GITHUB_ENV -Value "VR_SLANGC=$slangc"
+
+      - name: Configure (Debug + ASan + UBSan)
+        run: |
+          cmake -S . -B build-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DVR_BUILD_TESTS=ON \
+            -DVR_SLANGC_EXECUTABLE="$VR_SLANGC" 2>&1 | tee configure.log
+          if ! grep -q "slangc:" configure.log; then
+            echo "CMake did NOT find slangc, so it would compile the GLSL sources of the ported stages."
+            exit 1
+          fi
+
+      - name: Build the headless tests
+        # This list must stay equal to CMakeLists.txt's VR_TEST_TARGETS: ctest below runs every test
+        # that build registers, and a target missing here is a missing executable, which ctest reports
+        # as "Not Run" - the job goes red for a reason that looks like a test bug. That is exactly what
+        # made this job red on master twice (runs 34844586370 and 35441060587) and then a THIRD time:
+        # `test_meshlet` was registered by CMake and absent from this list (found and fixed with
+        # tests/test_docs.cpp, which now compares the two lists and fails by name). No sanitizer has
+        # ever reported anything in this job.
+        #
+        # test_shader_sources IS THE SHADER PIPELINE'S OWN GATE and it is deliberately here as well as in the
+        # Release job: it compares the four places a .spv is named (VR_SLANG_SOURCES, the two compile scripts,
+        # chores.cpp's loads) and requires the MESH entries to exist, so a mesh stage that silently stops being
+        # built - or a build rule the escape-hatch scripts do not mirror - fails a job rather than a picture.
+        # test_docs is the same idea one level up: the documents are doxygen INPUT and reach pdflatex, and it
+        # checks the invariants that keep them renderable (every docs/*.md in Doxyfile's INPUT, ASCII only,
+        # anchors resolving, fences balanced, quoted heap slots declared).
+        run: >-
+          cmake --build build-asan --target
+          test_app_config test_utility test_math test_animation test_gltf_loader test_toon_material_sidecar
+          test_shadow_fit test_render_resources test_pass test_shader_sources test_meshlet test_goo_toon_math test_docs
+          test_dynamic_link
+
+      - name: Run the headless tests under the sanitizers
+        # ASAN_OPTIONS/UBSAN_OPTIONS: halt on the first finding and print a stack trace, so a report
+        # fails the job instead of scrolling past. Two deliberate omissions:
+        #   - `detect_leaks` is NOT set: LeakSanitizer does not exist on Windows and passing the
+        #     option makes EVERY run abort with "detect_leaks is not supported on this platform"
+        #     (measured here - a CI job carrying it would go red on all six tests, reporting the
+        #     flag rather than a bug). It is off by default on this platform anyway.
+        #   - `abort_on_error` stays 0, so a finding produces a non-zero exit code from the test
+        #     binary (which is what ctest reads) rather than a crash dump.
+        env:
+          ASAN_OPTIONS: halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-asan --output-on-failure
+

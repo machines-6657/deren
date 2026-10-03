@@ -1,0 +1,80 @@
+// THE HEAP-NATIVE PROBE ======================================================
+//
+// It exists to answer one question the migration cannot proceed without, and to answer it as a NUMBER in the log
+// rather than as an opinion: does the heap-native shader path work in THIS renderer - `descriptor_heap`
+// declarations, a pipeline created with VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT and a NULL layout, its
+// parameters delivered by vkCmdPushDataEXT, and the two heaps bound in the command buffer that records it?
+//
+// WHY IT IS ITS OWN COMMAND BUFFER, and why the mask bake could not do this job: the bake is recorded into the
+// FRAME's command buffer (ray_tracing::structure_set builds the structures there), and binding the heaps is
+// exactly the measured poison that makes every set-based stage in that frame read the heap instead of its set.
+// So the bake is only safe to convert with the whole frame, while this probe runs once, at scene setup, in a
+// command buffer of its own - which is what makes it isolated rather than merely off the gate's path.
+//
+// WHAT IT READS: one texture from the bindless array (sampled through a sampler taken from the SAMPLER heap and
+// constructed at the use site, because a combined image sampler cannot be declared heap-native at all) and
+// nothing else - the two things that are hardest to get right. It writes the sampled alpha and red as two 16-bit
+// halves into a buffer the host reads back.
+#version 460
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_buffer_reference : require
+// The device address arrives as two 32-bit halves (the shape this project pushes every address in) and is put
+// back together as a uint64_t, which GLSL only has with this extension - the same one mask_bake.comp uses.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// The slot grid, which is the contract between this shader and the host (see docs/descriptor_heap_migration.md
+// and the test that compares the two files).
+#include "heap_slots.glsl"
+
+layout(local_size_x = 1) in;
+
+// The index of an element is `slot * heap_slot_stride` bytes into the heap: the grid's stride is declared here
+// explicitly, and the host writes its descriptors that far apart, so the two cannot disagree.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D heap_textures[];
+layout(descriptor_heap) uniform sampler heap_samplers[];
+
+// THE SECOND READ, and the one that is unambiguous: the material table is a BUFFER (no image layout to be in the
+// wrong state at setup time), and its element 0 is always the DEFAULT material this renderer reserves, whose base
+// colour factor is white. So the host can PREDICT the value - 1.0, i.e. 0xffff after the quantization below -
+// while the texture read can only say "a descriptor resolved". The layout must stay byte-identical to
+// material_record in vulkan/primitive.cppm (mask_bake.comp declares the same record for the same reason).
+struct ProbeMaterial {
+    uvec4 tex_indices;
+    uint emissive_index;
+    float alpha_cutoff;
+    float occlusion_strength;
+    uint _pad;
+    vec4 base_color_factor;
+    vec4 emissive_factor;
+    float metallic_factor;
+    float roughness_factor;
+    float normal_scale;
+    uint flags;
+};
+// The ARRAY name carries the HEAP index and the block member carries the record index: two index spaces, which is
+// why the default material is `[heap_slots_materials]` and then `.materials[0]`.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) readonly buffer ProbeMaterials { ProbeMaterial materials[]; } heap_material_tables[];
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer ProbeOut {
+    uint values[];
+};
+
+layout(push_constant) uniform HeapProbePush {
+    uvec2 destination;   // the output buffer's device address, as two 32-bit halves (the shape this project pushes)
+    uint texture_index;  // ABSOLUTE slot of the texture to sample, i.e. heap_slots_textures + the texture's index
+    uint sampler_index;  // ABSOLUTE slot in the SAMPLER heap, e.g. heap_sampler_texture
+} pc;
+
+void main() {
+    // The indices are push-constant values, i.e. dynamic as far as the compiler knows, so they carry the
+    // nonuniform qualifier - which is what GL_EXT_descriptor_heap asks for whenever an index is not a constant.
+    const vec4 sampled = texture(sampler2D(heap_textures[nonuniformEXT(pc.texture_index)], heap_samplers[nonuniformEXT(pc.sampler_index)]), vec2(0.5));
+    const uint red = uint(clamp(sampled.r, 0.0, 1.0) * 65535.0);
+    const uint alpha = uint(clamp(sampled.a, 0.0, 1.0) * 65535.0);
+    // ... and the material table's default record, which the host knows the value of
+    const float default_base_red = heap_material_tables[heap_slots_materials].materials[0].base_color_factor.x;
+    const uint base_red = uint(clamp(default_base_red, 0.0, 1.0) * 65535.0);
+    ProbeOut((uint64_t(pc.destination.y) << 32u) | uint64_t(pc.destination.x)).values[0] = red | (alpha << 16u);
+    ProbeOut((uint64_t(pc.destination.y) << 32u) | uint64_t(pc.destination.x)).values[1] = base_red;
+}

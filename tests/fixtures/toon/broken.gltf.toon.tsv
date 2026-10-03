@@ -1,0 +1,3 @@
+material	kind	name	value
+M_actor_test_body_01	slot	_BaseMap	T_actor_test_body_01_D
+M_actor_test_body_01	float	_UseDiffRampMap

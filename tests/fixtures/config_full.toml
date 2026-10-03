@@ -1,0 +1,68 @@
+# config consumed by the app_config unit tests (tests/test_app_config.cpp).
+# Keys deliberately cover every settings struct so a wrong parse/merge shows up.
+model = "Models/tri.gltf"
+
+[paths]
+shaders_dir = "shaders"
+screenshot_dir = "captures"
+
+[render]
+window_width = 800
+window_height = 600
+window_title = "vk_test"
+vsync = true
+clear_color = [0.1, 0.2, 0.3]
+shadow = false
+shadow_cascades = 2
+shadow_map_size = 1024
+shadow_cascade_blend = 0.25
+clustered_lights = false
+ssao = false
+ssao_radius = 1.5
+ssao_intensity = 0.5
+ssao_samples = 4
+rt_shadows = true
+rt_mask_bake = false
+rt_skin_bake = true
+animation_time = 0.75
+furnace = true
+unlit = true
+fxaa = true
+render_scale = 0.5
+upscale = "linear"
+gpu_timings = false
+gbuffer_debug = true
+gbuffer_channel = 5
+taa = true
+taa_blend_static = 0.8
+taa_blend_min = 0.2
+# the frame's static surround as a second model (`[render] background_glb`): a NON-default value here, so
+# the read-back is proven rather than inferred from an empty string that is also the compiled default
+background_glb = "bg/test-background.glb"
+validation_layers = false
+
+[lighting]
+env_size = 128
+env_mip_count = 5
+irr_size = 64
+lut_size = 128
+demo_lights = 3
+environment_hdr = "hdr/test-environment.hdr"
+environment_intensity = 0.8
+# The reference package's soft box (manifest: size 30 m, 4000 W, Blender [-3, -4, 15] -> Y-up [-3, 15, 4]),
+# with v1's two A/B switches deliberately OFF so a test reading this file proves the parser reads the
+# booleans instead of leaving their defaults behind. Position/target are relative to the AUTHOR'S ORIGIN
+# (the character's feet on the ground, world XZ = 0), not to the scene's bounding-box centre.
+area_light_size = 30.0
+area_light_power = 4000.0
+area_light_position = [-3.0, 15.0, 4.0]
+area_light_target = [0.0, 0.0, 0.0]
+area_light_intensity = 1.0
+area_light_irradiance = false
+area_light_shadow = false
+area_light_softness = 0.25
+
+[gui]
+show = false
+panel_width = 320
+panel_height = 200

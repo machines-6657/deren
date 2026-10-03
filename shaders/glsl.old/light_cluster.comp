@@ -1,0 +1,180 @@
+#version 450
+
+/**
+ * @file shaders/light_cluster.comp
+ * @brief Clustered light culling (M5): sort the punctual lights into screen tiles x depth slices.
+ * @ingroup shaders
+ *
+ * One invocation per CLUSTER, one dispatch per frame, on the graphics queue (before the frame's
+ * rendering). The grid is the screen cut into `cluster_tile_size` pixel tiles and
+ * `cluster_slice_count` EXPONENTIAL depth slices - the standard clustered scheme, since a linear
+ * slicing would spend most slices on the far range, where a light's screen footprint is tiny. For
+ * its cluster the invocation rebuilds the view-space box (the tile's corner rays unprojected at the
+ * slice's near and far depth) and appends every light whose bounding sphere intersects that box to
+ * the cluster's fixed-capacity list.
+ *
+ * The list is fixed capacity (`cluster_light_capacity` lights per cluster, one atomic counter per
+ * cluster): no prefix sum and no linked list, so the shading stage reads `count` and then that many
+ * indices directly. A cluster that overflows drops the extra lights - with 16 slots that needs 17+
+ * lights inside one 64 px tile at one depth, and the alternative (a linked list) costs a second
+ * indirection per light in the hottest loop of the renderer.
+ *
+ * The shading side of the contract is `cluster_slice_of()` in shaders/shading.glsl: the slice
+ * boundaries MUST be the same function on both sides, or a fragment lands in a cluster whose list
+ * was never built for it.
+ *
+ * The count buffer is host-coherent and memset at frame start, so this pass only appends.
+ */
+
+const int MAX_PUNCTUAL_LIGHTS = 128;  // vulkan::max_punctual_lights
+const int CLUSTER_LIGHT_CAPACITY = 32; // vulkan::cluster_light_capacity (lights stored per cluster)
+
+struct PunctualLight {
+    vec4 position; // xyz: world position (w unused)
+    vec4 color;    // xyz: linear color * intensity (w unused)
+    vec4 spot_dir; // xyz: spot axis, normalized for spot lights (w unused)
+    vec4 params;   // x = range (0 = infinite), y = 0 point / 1 spot, z = cos(outer cone), w = cos(inner cone, spot only)
+};
+
+// The heap-native declarations below need these two extensions IN THIS STAGE (see pbr.vert) plus the grid.
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#include "heap_slots.glsl"
+
+// The fields this stage needs; the members in between are declared so the offsets match the shared
+// layout (vulkan::light_ubo - see the static_asserts there). A stage may declare fewer members than
+// the CPU writes, but not a different layout up to the ones it uses.
+// HEAP-NATIVE: the arrays ARE the heap and the slots carry the FRAME (see heap_slots.glsl's index rule), so a read
+// is `light[heap_light_slot].field` and a write is `cluster_counts[heap_cluster_count_slot].counts[...]`. The block
+// layouts are unchanged - they are CPU/GPU contracts.
+// A `buffer`, not a `uniform`: see the camera block's note above.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) buffer LightUBO {
+    mat4 light_view_proj[4];
+    vec4 light_dir;
+    vec4 cascade_splits;
+    vec4 cascade_texel_world;
+    float shadow_enabled;
+    float brdf_model;
+    float diffuse_model;
+    float cascade_blend;
+    float cascade_count;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+    vec4 light_count; // x = active punctual light count
+    PunctualLight punctual_lights[MAX_PUNCTUAL_LIGHTS];
+    vec4 cluster_grid;  // x = tiles x, y = tiles y, z = slices, w = clustering enabled
+    vec4 cluster_depth; // x = near, y = far (view depths), z/w = screen size in pixels
+} light[];
+
+// A `buffer`, not a `uniform`: the heap descriptor is a STORAGE descriptor and the storage class a shader
+// reads it through has to match it (see shading.glsl's note). Only the first three members are read, and
+// std430 puts them at the same offsets std140 did.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) buffer CameraUBO {
+    mat4 view;
+    mat4 proj;
+    vec4 camera_pos;
+} camera[];
+
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) writeonly buffer ClusterCounts {
+    uint counts[];
+} cluster_counts[];
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) writeonly buffer ClusterIndices {
+    uint indices[];
+} cluster_indices[];
+
+// This stage takes NO other constants (it is a pure culling pass), but it reads the per-frame camera, light and
+// cluster descriptors, so it needs the two HEAP INDICES - and a heap pipeline has no layout to put a push constant
+// in, so they arrive through vkCmdPushDataEXT (see heap_slots.glsl).
+layout(push_constant) uniform ClusterPush {
+    uint frame_slot;
+    uint image_index;
+} push;
+#define heap_frame_slot (push.frame_slot)
+#define heap_image_index (push.image_index)
+
+layout(local_size_x = 64) in;
+
+/**
+ * @brief view-space box of one cluster
+ * @param tile_x / @p tile_y cluster tile coordinates (x right, y DOWN - the gl_FragCoord convention)
+ * @param slice depth slice index
+ * @param grid the active grid (tiles x, tiles y, slices)
+ * @param out_min / @p out_max the box corners in VIEW space
+ *
+ * The tile's NDC rectangle is unprojected at the slice's near and far depth. Both the y-flip and the
+ * [0,1] depth range are already inside `camera[heap_camera_slot].proj`, so the unprojected corners are in the same
+ * space the rendered fragments land in - which is what makes this box and the shader's cluster index
+ * describe the same volume.
+ */
+void cluster_bounds(uint tile_x, uint tile_y, uint slice, uvec3 grid, out vec3 out_min, out vec3 out_max) {
+    const float near_depth = max(light[heap_light_slot].cluster_depth.x, 1e-4);
+    const float far_depth = max(light[heap_light_slot].cluster_depth.y, near_depth * 1.0001);
+    const float ratio = far_depth / near_depth;
+    const float slice_near = near_depth * pow(ratio, float(slice) / float(grid.z));
+    const float slice_far = near_depth * pow(ratio, float(slice + 1u) / float(grid.z));
+
+    const vec2 screen = max(light[heap_light_slot].cluster_depth.zw, vec2(1.0));
+    const vec2 px_min = vec2(float(tile_x), float(tile_y)) * 64.0; // vulkan::cluster_tile_size
+    const vec2 px_max = min(px_min + 64.0, screen);
+    const vec2 ndc_min = px_min / screen * 2.0 - 1.0;
+    const vec2 ndc_max = px_max / screen * 2.0 - 1.0;
+
+    const mat4 inv_proj = inverse(camera[heap_camera_slot].proj);
+    out_min = vec3(3.4e38);
+    out_max = vec3(-3.4e38);
+    for (int corner = 0; corner < 4; ++corner) {
+        const vec2 ndc = vec2((corner & 1) != 0 ? ndc_max.x : ndc_min.x, (corner & 2) != 0 ? ndc_max.y : ndc_min.y);
+        for (int plane = 0; plane < 2; ++plane) {
+            const vec4 clip = vec4(ndc, plane == 0 ? 0.0 : 1.0, 1.0);
+            const vec4 view_point = inv_proj * clip;
+            const vec3 ray = view_point.xyz / view_point.w; // view-space point on that plane
+            // scale the ray so its view depth (positive in front of the camera) is the slice's
+            const float depth = plane == 0 ? slice_near : slice_far;
+            const vec3 point = ray * (depth / max(-ray.z, 1e-6));
+            out_min = min(out_min, point);
+            out_max = max(out_max, point);
+        }
+    }
+}
+
+void main() {
+    const uint tiles_x = uint(light[heap_light_slot].cluster_grid.x);
+    const uint tiles_y = uint(light[heap_light_slot].cluster_grid.y);
+    const uint slices = uint(light[heap_light_slot].cluster_grid.z);
+    if (tiles_x == 0u || tiles_y == 0u || slices == 0u || light[heap_light_slot].cluster_grid.w < 0.5) {
+        return; // clustering disabled: the shading stage loops every light instead
+    }
+    const uint cluster = gl_GlobalInvocationID.x;
+    const uint cluster_count = tiles_x * tiles_y * slices;
+    if (cluster >= cluster_count) {
+        return;
+    }
+    const uint slice = cluster / (tiles_x * tiles_y);
+    const uint tile_index = cluster % (tiles_x * tiles_y);
+    const uint tile_x = tile_index % tiles_x;
+    const uint tile_y = tile_index / tiles_x;
+
+    vec3 box_min;
+    vec3 box_max;
+    cluster_bounds(tile_x, tile_y, slice, uvec3(tiles_x, tiles_y, slices), box_min, box_max);
+
+    const uint light_total = min(uint(light[heap_light_slot].light_count.x), uint(MAX_PUNCTUAL_LIGHTS));
+    for (uint i = 0u; i < light_total; ++i) {
+        const vec4 position = light[heap_light_slot].punctual_lights[i].position;
+        const float range = light[heap_light_slot].punctual_lights[i].params.x;
+        // view-space light sphere vs the cluster box: the closest point of the box to the center
+        const vec3 center = (camera[heap_camera_slot].view * vec4(position.xyz, 1.0)).xyz;
+        const vec3 closest = clamp(center, box_min, box_max);
+        const vec3 delta = center - closest;
+        // range == 0 is the "no cutoff" light (its falloff never reaches zero): always include it
+        const bool reaches = range <= 0.0 || dot(delta, delta) <= range * range;
+        if (!reaches) {
+            continue;
+        }
+        const uint slot = atomicAdd(cluster_counts[heap_cluster_count_slot].counts[cluster], 1u);
+        if (slot < uint(CLUSTER_LIGHT_CAPACITY)) {
+            cluster_indices[heap_cluster_index_slot].indices[cluster * uint(CLUSTER_LIGHT_CAPACITY) + slot] = i;
+        }
+    }
+}

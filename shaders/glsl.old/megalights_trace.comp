@@ -1,0 +1,347 @@
+#version 460 // GL_EXT_ray_query is written against GLSL 4.60 (see shaders/rt_shadow.comp)
+#extension GL_EXT_ray_query : require
+
+/**
+ * @file shaders/megalights_trace.comp
+ * @brief Stochastic punctual lighting: a few sampled lights per pixel, one visibility ray each.
+ * @ingroup shaders
+ *
+ * WHAT THIS EXISTS FOR: every punctual light in this engine is unshadowed - `shaders/shading.glsl`'s
+ * cluster loop accumulates a light's radiance with no visibility term at all, so a demo light behind a
+ * column lights the wall in front of it. The sun is the only shadowed light (cascades, or
+ * `shaders/rt_shadow.comp`'s one ray per pixel). The fix is not "one shadow ray per light per pixel" -
+ * that cost grows with the light count - but the estimator Unreal's MegaLights uses: each pixel picks a
+ * few lights STOCHASTICALLY, with a probability proportional to how much each light actually
+ * contributes, and traces one ray per pick. `docs/reference/megalights_stochastic_lighting.md` is the
+ * study this is ported from, with the UE file and line for every mechanism below.
+ *
+ * THE ESTIMATOR, in the order it runs (UE: MegaLightsSampling.usf, MegaLightsLightTargetPDF.ush):
+ *
+ *  1. THE CANDIDATE SET is the pixel's clustered light list - `shaders/light_cluster.comp` already culls
+ *     the punctual lights into screen tiles x depth slices with a capacity of 32, which is numerically
+ *     the same cap UE's light grid cell uses. Nothing new is built for this pass to find its lights.
+ *  2. THE TARGET PDF is a LOG-compressed shaded luminance:
+ *         W = log2(Lum * SmoothFalloffMask(Lum, min_weight) + 1)
+ *     where `Lum` is the real BRDF evaluated for that light at this pixel (`punctual_light_radiance`
+ *     and `evaluate_direct_light`, both shared with the raster path rather than copied), and
+ *     `SmoothFalloffMask(X, T) = pow2(saturate(1 - pow4(T / X)))` rolls a light's weight smoothly to
+ *     zero below the minimum. The LOG is the point: a light a hundred times brighter buys about seven
+ *     times the samples instead of a hundred, which keeps one very bright (and often occluded) light
+ *     from consuming the whole ray budget.
+ *  3. THE SELECTION is a weighted reservoir (RIS) with one reservoir per sample, stratified by a single
+ *     per-pixel uniform: `r[k] = (u + k) / N`, and for each candidate
+ *         tau = Sum / (Sum + W);  Sum += W
+ *         r[k] < tau  -> keep the old light and r[k] /= tau
+ *         else        -> take this light, r[k] = (r[k] - tau) / (1 - tau)
+ *     so a light is kept with probability proportional to its weight. The sample's estimator weight is
+ *     `Sum / W_k` (UE: `Sampling.usf:544`), i.e. `1/p` for the selection pmf `p = W_k / Sum`.
+ *  4. THE RAY: one `rayQuery` per selected sample, from this pixel's world position towards the light,
+ *     `tmax` = the distance to the light, `tmin` = the self-intersection guard, flags Opaque +
+ *     TerminateOnFirstHit (the same pair `shaders/rt_shadow.comp` uses, and the same reason: nothing is
+ *     shaded at the hit, only "was there one"). The origin is pushed along the normal by a bias that
+ *     SHRINKS as the light approaches the normal direction, which is UE's shape
+ *     (`lerp(max(0.01,0.1), 0.01, saturate(N dot L))`) and the same argument `shaders/rt_shadow.comp`
+ *     makes for scaling its bias with distance.
+ *  5. FIREFLY CLAMP, in the estimator rather than in the denoiser: a single sample's weight is capped
+ *     (UE clamps 20 for a light guided as visible and 5 for one that was hidden last frame), so the rare
+ *     sample that carries `Sum / W_k` alone cannot write an arbitrarily bright pixel.
+ *
+ * WHAT THIS PASS DOES NOT DO YET, stated rather than discovered later: it writes the RAW estimate - no
+ * temporal accumulation, no spatial filter, no history-guided sampling (`GuideByHistory`), and the
+ * sample's own surface is the half-resolution texel's, not one surface per sample. `docs/megalights.md`
+ * stages those, and the reference note's section 2 is the one to read before judging the noise: the
+ * guide is what stops a bright OCCLUDED light from being sampled over and over.
+ *
+ * The alpha lane carries the FRACTION OF SAMPLES THAT FOUND THE LIGHT UNBLOCKED, not a radiance: it is
+ * the cheapest confidence signal the temporal resolve can have (a pixel whose samples all hit geometry
+ * has no information to accumulate), and it costs nothing here.
+ */
+
+// The two names the shared slot macros use (see deferred.frag): textual, so they may be defined here, while
+// shading.glsl - which uses them - is included after the push block that declares `pc`.
+#define heap_frame_slot (pc.frame_slot)
+#define heap_image_index (pc.image_index)
+
+// shading.glsl's declarations are heap-native: these two extensions must precede the first non-preprocessor token,
+// which is the local_size declaration below rather than the include.
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : enable
+// THE GRID HEADER, early: this stage's OWN declarations below are heap-native and need its constants, while
+// shading.glsl (which also carries it) is included only after the push block. The header has an include guard.
+#include "heap_slots.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The scene set: the camera, the light UBO, the cluster counts and indices, the shadow map, the IBL probes and the
+// BRDF - all of it comes with `shading.glsl`, WHICH IS INCLUDED AFTER THE PUSH BLOCK BELOW because its functions
+// address the per-frame arrays through the slot macros above (a macro expands at its use site, so `pc` has to exist
+// by then).
+
+// ... and the scene set's top level structure, declared by the includer because `shading.glsl` has no
+// use for it (same split as the ray-traced shadow's). It is a HEAP descriptor (its device address), and it is
+// rebuilt every frame, so its slot carries the FRAME rather than the image.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform accelerationStructureEXT heap_tlas[];
+
+// The G-buffer set (1): the stored surface this pixel's lights are evaluated for. HEAP-NATIVE like every other
+// converted stage - the images are resource heap descriptors, the sampler is the G-buffer's NEAREST one (these are
+// exact texel fetches), and the indices are the SWAPCHAIN IMAGE's because these images are per image.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D gbuffer_albedo_texture[];   // RGBA8: albedo.rgb + metallic
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D gbuffer_normal_texture[];   // RGBA16F: world normal.xyz + roughness
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D gbuffer_material_texture[]; // RGBA8: .b = the material's baked AO
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D gbuffer_depth_texture[];    // the pass's own 1x depth
+
+// This pass's output: rgb = the punctual lights' contribution, a = the fraction of the samples whose ray found the
+// light (see the header). It is a STORAGE image, so it uses the STORAGE descriptor the grid reserves for it
+// (heap_slots_ml_trace_storage) rather than the sampled one the lighting stage reads - one image, two descriptors,
+// because no single heap descriptor is both kinds.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride, rgba16f) uniform image2D ml_output_image[];
+
+/// @brief the compile-time bound on samples per pixel: UE supports 1, 2 and 4, and the loop is bounded by
+///        the constant so the reservoir arrays have a size (the ACTIVE count is a push lane).
+const int ML_MAX_SAMPLES = 4;
+/// @brief UE's `r.MegaLights.MaxShadingWeight`: how much a single sample may contribute on its own. The
+///        value is an absolute cap on the estimator weight, and it is what keeps one unblocked sample of
+///        an occluded-but-bright light from writing a firefly.
+const float ML_MAX_SHADING_WEIGHT = 20.0;
+
+layout(push_constant) uniform MlPush {
+    mat4 inv_view_proj; // clip -> world, the same reconstruction the lighting stage and rt_shadow use
+    // x = samples per pixel (1..ML_MAX_SAMPLES), y = the minimum sample weight (UE's
+    // r.MegaLights.MinSampleWeight, the threshold its smooth cut rolls to zero at),
+    // z = the ray tmin (the engine's fixed self-intersection guard),
+    // w = a per-frame counter so the sample sequence differs every frame.
+    vec4 params;
+    // x = the normal-offset floor, y = the offset at grazing incidence (UE's lerp(0.1, 0.01, N dot L)),
+// z = the emitter's ANGULAR radius (0 = a point light and hard shadows, and 0 is the DEFAULT: see the
+//     soft-shadow block for why this is opt-in rather than a fix),
+    // pair). z/w unused.
+    vec4 bias;
+    // THE HEAP INDICES (see heap_slots.glsl), at the END so every field above keeps its offset.
+    uint frame_slot;
+    uint image_index;
+} pc;
+
+// ... and the scene-set header, INCLUDED ONLY NOW: its functions read the per-frame arrays through the slot macros,
+// which expand to `pc.frame_slot`, so `pc` has to exist first.
+#include "shading.glsl"
+
+/** @brief a uniform in [0,1) from an integer state (the same PCG-style hash the GI tracer uses) */
+uint hash_u32(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+/** @brief the next uniform in [0,1) from @p state */
+float next_uniform(inout uint state) {
+    state = hash_u32(state);
+    return float(state) * (1.0 / 4294967296.0);
+}
+
+/** @brief world position of a depth-buffer sample (the lighting stage's own reconstruction) */
+vec3 world_position_from_depth(vec2 uv, float depth) {
+    const vec4 clip = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    const vec4 world = pc.inv_view_proj * clip;
+    return world.xyz / world.w;
+}
+
+/**
+ * @brief UE's `SmoothFalloffMask`: a smooth cut to zero below @p threshold
+ * @param x the quantity being cut (a shaded luminance)
+ * @param threshold the value it is cut at (the minimum sample weight)
+ * @return 1 for a bright sample, falling to 0 below the threshold
+ *
+ * `pow2(saturate(1 - pow4(T/X)))`, exactly as `MegaLights.ush:409-420` writes it, and the SAME value is
+ * used to build the sampling weight and to scale the final estimate - which is what keeps the estimator
+ * consistent when the mask is far from 1 (UE applies it in both places from the same luminance).
+ */
+float smooth_falloff_mask(float x, float threshold) {
+    if (x <= 0.0) {
+        return 0.0;
+    }
+    const float t = clamp(1.0 - pow(threshold / x, 4.0), 0.0, 1.0);
+    return t * t;
+}
+
+/**
+ * @brief was the light at @p dir reachable from @p origin within @p distance
+ * @param origin the world-space start (already pushed off the surface)
+ * @param dir the unit direction towards the light
+ * @param distance the distance to the light (the ray's tmax)
+ * @param tmin the self-intersection guard (see the push block)
+ * @return 1.0 when nothing blocked the ray, 0.0 when something did
+ *
+ * A ray SHORTER than tmin has no interval to search - `rayQueryInitializeEXT` with tmax <= tmin is
+ * forbidden by the specification - and a light inside the surface it lights is the honest reading of
+ * that, so the query is skipped and the light counts as unblocked.
+ */
+float visibility(vec3 origin, vec3 dir, float distance, float tmin) {
+    if (distance <= tmin) {
+        return 1.0;
+    }
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, heap_tlas[heap_slots_tlas + heap_frame_slot], gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, tmin, dir, distance);
+    while (rayQueryProceedEXT(query)) {
+    }
+    return rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+}
+
+void main() {
+    const ivec2 ml_extent = imageSize(ml_output_image[heap_slots_ml_trace_storage + heap_image_index]);
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= ml_extent.x || pixel.y >= ml_extent.y) {
+        return; // the dispatch is rounded up to the workgroup size
+    }
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(ml_extent);
+
+    const float depth = heap_texel(gbuffer_depth_texture[heap_slots_gbuffer_depth + heap_image_index], heap_sampler_gbuffer, uv).r;
+    if (depth >= 1.0) {
+        imageStore(ml_output_image[heap_slots_ml_trace_storage + heap_image_index], pixel, vec4(0.0)); // background: no surface, so no punctual light on one
+        return;
+    }
+
+    // This texel's surface, at HALF resolution - the pass's own resolution, like the GI tracer's. The
+    // lighting it produces is a half-resolution image for the same reason the GI's is: the signal is
+    // lower frequency than the shading that consumes it, and the resolve is where it meets full
+    // resolution again.
+    const vec4 albedo_metallic = heap_texel(gbuffer_albedo_texture[heap_slots_gbuffer_albedo + heap_image_index], heap_sampler_gbuffer, uv);
+    const vec3 albedo = albedo_metallic.rgb;
+    const float metallic = albedo_metallic.a;
+    const vec4 normal_roughness = heap_texel(gbuffer_normal_texture[heap_slots_gbuffer_normal + heap_image_index], heap_sampler_gbuffer, uv);
+    const vec3 normal = normalize(normal_roughness.xyz);
+    const float roughness = normal_roughness.w;
+    const vec3 world_pos = world_position_from_depth(uv, depth);
+    const vec3 v = normalize(camera[heap_camera_slot].camera_pos.xyz - world_pos);
+    const vec3 f0 = mix(vec3(0.04), albedo, metallic);
+
+    // The cluster lookup happens at the FULL-resolution pixel this half-resolution texel stands for: the
+    // light grid is built in full-resolution tiles (see shaders/light_cluster.comp), so a half-resolution
+    // texel that used its own coordinates would read the neighbouring tile's list at every tile edge.
+    const ivec2 full_extent = textureSize(sampler2D(gbuffer_depth_texture[heap_slots_gbuffer_depth + heap_image_index], heap_samplers[heap_sampler_gbuffer]), 0);
+    const ivec2 full_pixel = ivec2((vec2(pixel) + 0.5) * vec2(full_extent) / vec2(ml_extent));
+    const int cluster = cluster_index_at(full_pixel, world_pos);
+    const int light_count = cluster_light_count_for(cluster);
+
+    const int samples = clamp(int(pc.params.x), 1, ML_MAX_SAMPLES);
+    const float min_weight = pc.params.y;
+
+    // A per-pixel, per-frame state: the ray sequence and the light sequence both have to change between
+    // frames, or a temporal filter would be fed the same mistake instead of an average of different ones.
+    uint state = hash_u32(uint(pixel.x) + uint(pixel.y) * 4096u + uint(pc.params.w) * 2654435761u);
+    const float pick_random = next_uniform(state);
+
+    // ---- the reservoir, one per sample, initialized to the stratifying sequence ----
+    float reservoir_random[ML_MAX_SAMPLES];
+    int reservoir_light[ML_MAX_SAMPLES];
+    float reservoir_weight[ML_MAX_SAMPLES];
+    for (int k = 0; k < samples; ++k) {
+        reservoir_random[k] = (pick_random + float(k)) / float(samples);
+        reservoir_light[k] = -1;
+        reservoir_weight[k] = 0.0;
+    }
+
+    // ---- one pass over the candidates, building the target PDF and updating every reservoir ----
+    float weight_sum = 0.0;
+    for (int i = 0; i < light_count; ++i) {
+        const int light_index = cluster_light_index(cluster, i);
+        const PunctualLight pl = light[heap_light_slot].punctual_lights[light_index];
+        vec3 dir;
+        float distance;
+        const vec3 radiance = punctual_light_radiance(pl, world_pos, dir, distance);
+        if (radiance == vec3(0.0)) {
+            continue; // out of range, or outside the spot's cone: not a candidate at all
+        }
+        const vec3 shaded = evaluate_direct_light(normal, v, albedo, metallic, roughness, f0, dir, radiance);
+        const float lum = dot(shaded, vec3(0.2126, 0.7152, 0.0722));
+        // The log compression and the smooth cut, in that order (UE: the cut is inside the log's
+        // argument). A luminance at or below the threshold lands on a weight of 0 and is dropped.
+        const float weight = log2(lum * smooth_falloff_mask(lum, min_weight) + 1.0);
+        if (!(weight > 0.0)) {
+            continue; // zero, or a NaN out of a degenerate light
+        }
+        const float tau = weight_sum / (weight_sum + weight);
+        weight_sum += weight;
+        for (int k = 0; k < samples; ++k) {
+            if (reservoir_random[k] < tau) {
+                reservoir_random[k] /= max(tau, 1e-6); // keep the light already held, rescale its weight
+            } else {
+                reservoir_random[k] = (reservoir_random[k] - tau) / max(1.0 - tau, 1e-6);
+                reservoir_light[k] = light_index;
+                reservoir_weight[k] = weight;
+            }
+            reservoir_random[k] = clamp(reservoir_random[k], 0.0, 0.9999);
+        }
+    }
+
+    // ---- trace and shade the selected samples ----
+    vec3 lighting = vec3(0.0);
+    float unblocked = 0.0;
+    if (weight_sum > 0.0) {
+        for (int k = 0; k < samples; ++k) {
+            if (reservoir_light[k] < 0 || !(reservoir_weight[k] > 0.0)) {
+                continue; // this reservoir never found a candidate
+            }
+            const PunctualLight pl = light[heap_light_slot].punctual_lights[reservoir_light[k]];
+            vec3 dir;
+            float distance;
+            const vec3 radiance = punctual_light_radiance(pl, world_pos, dir, distance);
+            // The origin bias shrinks as the light approaches the normal: at grazing incidence the surface
+            // and the ray are nearly parallel, and a bias small enough there would let the ray re-hit the
+            // triangle it started on. UE's pair, and the same shape rt_shadow.comp's distance-scaled floor
+            // argues for.
+            const float offset = mix(pc.bias.y, pc.bias.x, clamp(dot(normal, dir), 0.0, 1.0));
+            const vec3 origin = world_pos + normal * offset;
+
+            // ---- SOFT SHADOWS: the emitter has a size, so the ray aims at a DISC around its centre ----
+            //
+            // WHY THIS IS THE FIX FOR A FLICKERING SHADOW EDGE, and not a nicety: a point light's visibility is
+            // a binary answer, so a pixel whose shadow boundary falls inside it answers 0 or 1 depending on
+            // where the boundary sits THIS frame. TAA's sub-pixel jitter moves the boundary every frame, so the
+            // pixel snaps between lit and unlit - and the measurement says that is the whole story here: the
+            // flicker on those pixels is the same at ONE sample per pixel as at four (538 vs 531 hot pixels,
+            // same worst 44.7), which is impossible for sampling noise and exactly what a boundary POSITION
+            // change looks like. It is also why neither the history policy nor the spatial pre-filter moved it:
+            // the neighbours shift together, and the history is accepted because its value legitimately changed.
+            //
+            // Aiming the SAME ray (no extra cost: one ray per sample, as before) at a uniformly distributed
+            // point of a disc of radius `distance * pc.bias.z` turns that binary answer into the fraction of the
+            // emitter the pixel can see: a boundary inside the pixel now changes the answer GRADUALLY as it
+            // moves, so the frame-to-frame step is proportional to the sub-pixel motion instead of being the
+            // full shadow contrast. The penumbra's width is set by the emitter's ANGULAR size, which is why the
+            // parameter is an angle rather than a world radius - a distant light casts the same softness as a
+            // near one of the same angular size, which is what the eye expects.
+            //
+            // 0 keeps the old hard-shadow behaviour exactly (no jitter, no extra random draws), and the BRDF is
+            // evaluated at the CENTRE direction: the representative-point approximation every real-time
+            // renderer makes for a small emitter, and it keeps the estimator's weights untouched.
+            vec3 ray_dir = dir;
+            float ray_distance = distance;
+            if (pc.bias.z > 0.0) {
+                const vec3 up = abs(dir.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+                const vec3 tangent = normalize(cross(up, dir));
+                const vec3 bitangent = cross(dir, tangent);
+                // sqrt keeps the disc's area density uniform (the same trick the light samplers use)
+                const float radius = distance * pc.bias.z * sqrt(next_uniform(state));
+                const float phi = 6.2831853071795864 * next_uniform(state);
+                const vec3 target = world_pos + dir * distance + (tangent * cos(phi) + bitangent * sin(phi)) * radius;
+                ray_dir = normalize(target - origin);
+                // a margin, because the lateral target sits a hair off the sphere the point light lies on
+                ray_distance = distance * 1.01;
+            }
+            const float visible = visibility(origin, ray_dir, ray_distance, pc.params.z);
+            const vec3 shaded = evaluate_direct_light(normal, v, albedo, metallic, roughness, f0, dir, radiance);
+            // `Sum / W_k` is 1/p for the reservoir's selection probability; the firefly cap bounds what a
+            // single sample may carry; `1/samples` is the estimator's own normalization, and the smooth cut
+            // is applied HERE as well as in the PDF (from the same luminance), which is what keeps the
+            // estimate consistent when the cut is not 1.
+            const float lum = dot(shaded, vec3(0.2126, 0.7152, 0.0722));
+            const float weight = min(weight_sum / reservoir_weight[k], ML_MAX_SHADING_WEIGHT) * smooth_falloff_mask(lum, min_weight) / float(samples);
+            lighting += shaded * visible * weight;
+            unblocked += visible;
+        }
+    }
+    imageStore(ml_output_image[heap_slots_ml_trace_storage + heap_image_index], pixel, vec4(lighting, unblocked / float(samples)));
+}

@@ -1,0 +1,57 @@
+---
+# clang-tidy 配置（与 .clang-format 配合使用）
+# 需要 compile_commands.json（CMake 生成）：
+#   cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ...
+#   clang-tidy -p build <file>...
+# 启用一组保守的检查；运行时可用 -checks=... 临时覆盖。
+#
+# 已禁用的噪音/误报检查（图形代码 + 自研 std 模块场景）：
+#   - bugprone-std-namespace-modification     : vstd.cppm (modified from libc++) re-opens
+#     namespace std only to re-export libc++ entities via using - intentional, not an extension
+#   - bugprone-invalid-enum-default-initialization : Vulkan 结构体全 0 初始化是标准做法
+#   - bugprone-easily-swappable-parameters         : 同类型相邻参数在图形 API 中常见，误报为主
+#   - bugprone-signed-bitwise                      : 位运算操作数有符号，多为 Vulkan 结构体/位掩码固有写法
+#   - performance-enum-size                   : 对每个无底层类型枚举都报，收益微小
+#   - readability-magic-numbers               : Vulkan 调用充满常量/0/1，噪音为主
+#   - readability-redundant-member-init       : 成员默认初始化冗余提示，风格噪音
+#   - readability-redundant-declaration       : 模块 + libc++ 系统头组合下对
+#     __new/global_new_delete.h 的 operator new/delete 误报（无 file:line 的噪音）
+#   - readability-identifier-length           : 图形代码常见短变量名
+#   - readability-uppercase-literal-suffix    : 字面量后缀大小写纯风格偏好
+#   - readability-implicit-bool-conversion    : Vulkan 代码习惯（指针/句柄判空）
+#   - readability-math-missing-parentheses    : 数学表达式括号风格
+#   - clang-analyzer-optin.performance.Padding : 已评估（clang-tidy 22, 2026-09）：deren::vulkan::runtime
+#     有 78 个 padding 字节（最优 14），但它是进程单例——重排上百个字段最多省 ~64B/实例，
+#     却会拆散按功能分组的注释、产生巨大 diff。收益 < 搅动成本，永久排除。
+#   - readability-function-cognitive-complexity / readability-function-size :
+#     复杂度类检查暂不处理（按用户要求）
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-std-namespace-modification,
+  -bugprone-invalid-enum-default-initialization,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-signed-bitwise,
+  clang-analyzer-*,
+  -clang-analyzer-optin.performance.Padding,
+  performance-*,
+  -performance-enum-size,
+  readability-*,
+  -readability-magic-numbers,
+  -readability-redundant-member-init,
+  -readability-redundant-declaration,
+  -readability-identifier-length,
+  -readability-uppercase-literal-suffix,
+  -readability-implicit-bool-conversion,
+  -readability-math-missing-parentheses,
+  -readability-function-cognitive-complexity,
+  -readability-function-size,
+
+# 把所有警告视为错误会阻碍迭代，这里先保持警告
+WarningsAsErrors: ''
+
+# 只检查项目自身代码，不深入第三方头文件（third_party 下的第三方库不检查）
+HeaderFilterRegex: '^(?!.*third_party).*$'
+
+# 让 clang-tidy 使用仓库内的 .clang-format 作为格式基准
+FormatStyle: file

@@ -1,0 +1,22 @@
+{
+  "asset": { "version": "2.0" },
+  "materials": [
+    {
+      "name": "M_with_extras",
+      "pbrMetallicRoughness": { "baseColorFactor": [ 1.0, 1.0, 1.0, 1.0 ] },
+      "extras": {
+        "efFloats": { "_Specular": 0.0, "_ParallaxScale": 0.5, "_UnclaimedRow": 0.9, "_OutlineOffsetZ": 0.22 },
+        "efColors": { "_SdfColor": [ 1.0, 1.0, 1.0, 1.0 ] }
+      }
+    },
+    {
+      "name": "M_fractional_extras",
+      "pbrMetallicRoughness": {},
+      "extras": { "efFloats": { "_Specular": 0.454, "_ParallaxScale": 0.03, "_UnclaimedRow": 1.0 } }
+    },
+    {
+      "name": "M_no_extras",
+      "pbrMetallicRoughness": {}
+    }
+  ]
+}

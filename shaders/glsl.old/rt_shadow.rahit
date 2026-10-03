@@ -1,0 +1,186 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// The bindless texture array is indexed by the material's own index, exactly as shaders/surface.glsl and
+// shaders/mask_bake.comp index it: plain indices into a partially-bound array.
+#extension GL_EXT_nonuniform_qualifier : enable
+
+/**
+ * @file shaders/rt_shadow.rahit
+ * @brief The ray-traced shadow's any-hit shader: the alphaMode MASK cut, which a ray query cannot run.
+ * @ingroup shaders
+ *
+ * THIS STAGE IS THE REASON THE SHADOW MOVED ONTO A RAY-TRACING PIPELINE. A ray query has no any-hit stage, so
+ * every triangle it meets is solid: an alphaMode MASK surface - a leaf card, a chain-link fence, a cut-out sign
+ * - casts the shadow of its BOUNDING TRIANGLES. That is the limitation `rt_mask_bake`'s triangle-collapse rule
+ * tried to paper over and measured as worse than doing nothing (+1.29 mean against not baking at all). A traced
+ * ray runs this stage instead, and the stage cuts the transparent part of a triangle with
+ * `ignoreIntersectionEXT`.
+ *
+ * WHAT IT DOES, in one line: it interpolates the material's base colour ALPHA at the hit and refuses the
+ * intersection when that alpha is below the material's cutoff. The predicate is deliberately the SAME ONE THE
+ * RASTER PATHS USE - `shaders/shadow.frag` discards on
+ * `base_color_factor.a * texture(albedo, uv).a < alpha_cutoff` and `shaders/surface.glsl` on the equivalent
+ * `base_color.a < alpha_cutoff` - because a ray-traced shadow whose holes do not match the raster shadow's is
+ * worse than either alone. Two details differ, and both are forced by where this runs:
+ *  - `textureLod(..., 0.0)`: a hit shader has no derivatives, and LOD 0 is what the raster test samples anyway;
+ *  - the UV is not an interpolated varying, because there is none. It is FETCHED: `gl_PrimitiveID` names the
+ *    triangle, its three vertex indices come from the geometry's index buffer and their UVs from the vertex
+ *    buffer, both through the device addresses in binding 17's instance record - the same arithmetic
+ *    `shaders/mask_bake.comp` already performs (that file's comment says "the same arithmetic the hit shader
+ *    uses", and this is that hit shader).
+ *
+ * WHY `hitAttributeEXT` IS NOT USED: it is written by an INTERSECTION shader, and this pipeline has none -
+ * triangle geometry is intersected by the fixed-function unit - and
+ * `VkAccelerationStructureGeometryTrianglesDataKHR` has no attribute field to declare one in. The fetch above
+ * is therefore not a workaround; it is the only channel a triangle hit has to its own vertices.
+ *
+ * TWO FLAGS WERE LIFTED FOR THIS STAGE, AND WHAT THEY ACTUALLY DO WAS MEASURED RATHER THAN ASSUMED:
+ *  - `gl_RayFlagsOpaqueEXT` in the raygen and `VK_GEOMETRY_OPAQUE_BIT_KHR` on the BLAS geometry both DECLARE
+ *    "no any-hit shader may be invoked" - for the ray and for the geometry respectively;
+ *  - measured on an NVIDIA RTX 4060 (591.59.0.0), with the closest-hit stage silenced so that ONLY this stage
+ *    could answer the ray, the frame stayed correct with the ray flag set, with the geometry flag set, and with
+ *    both - so on this driver neither flag suppressed this stage's invocation, and the payload was answered
+ *    here in all three arms. The three arms differ by 0.01 whole-frame mean, which is the geometry flag
+ *    changing the built structure and with it the traversal order, not a visibility change.
+ *  - they are lifted anyway, and that is the point: this stage must not rest on a driver over-invoking a stage
+ *    that two declarations say must not run. A conforming driver would skip it and the cut would silently do
+ *    nothing - the worst kind of failure, because the frame would still look like a shadow. The ray flag is
+ *    gone from `rt_shadow.rgen`, and `vulkan/acceleration_structure/acceleration_structure.cpp` no longer sets
+ *    the geometry flag.
+ *
+ * WHAT IT COSTS: three vertex fetches and one texture fetch per hit on a MASK material (not per pixel - the
+ * fetch is behind the material's own flag), against the bake's cost of expanding every MASK triangle once at
+ * load. A later step compares the two arms and can put an opacity micromap in front of this stage, which is the
+ * hardware answer to the same question and is why `VK_EXT_opacity_micromap` is enabled.
+ */
+
+// The material table and the bindless texture array, HEAP-NATIVE now (see docs/descriptor_heap_migration.md): the
+// bindless array is the shared `heap_textures` from the grid header, and the table is an array of blocks whose ARRAY
+// name carries the heap slot while the block member carries the record index. The extensions are per stage.
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#include "heap_slots.glsl"
+
+// This stage declares no other constants, but it reads the per-FRAME mask instance table, so it needs the two HEAP
+// INDICES - and a heap pipeline has no layout to put a push constant in, so they arrive through vkCmdPushDataEXT
+// (see heap_slots.glsl). The block is its own because a stage has exactly one.
+layout(push_constant) uniform AnyHitPush {
+    uint frame_slot;
+    uint image_index;
+} pc;
+#define heap_frame_slot (pc.frame_slot)
+#define heap_image_index (pc.image_index)
+struct MaskMaterial {
+    uvec4 tex_indices; // albedo, metallic-roughness, normal, occlusion (indices into textures[])
+    uint emissive_index;
+    float alpha_cutoff;
+    float occlusion_strength;
+    uint _pad;
+    vec4 base_color_factor;
+    vec4 emissive_factor;
+    float metallic_factor;
+    float roughness_factor;
+    float normal_scale;
+    uint flags; // bit4: alphaMode MASK - the bit that makes this stage do anything at all
+};
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) readonly buffer MaskMaterials { MaskMaterial materials[]; } heap_material_tables[];
+
+// The instance table: one record per instance of the top level structure, filled by EVERY structure build and
+// read, until now, by nothing (see acceleration_structure::instance_record, whose 96-byte std430 layout this
+// mirrors). The addresses are held as two 32-bit halves, the shape this project carries an address in.
+struct MaskInstance {
+    uvec2 vertex_address; // the vertex buffer's device address
+    uvec2 index_address;  // the index buffer's, or zero when the geometry is not indexed (the bake's output)
+    mat4 model;           // object -> world
+    uint vertex_stride;   // bytes per vertex of the interleaved layout
+    uint index_type;      // VkIndexType: 0 = uint16, 1 = uint32
+    uint material_index;  // into the material table above
+    uint primitive_index;
+};
+// The instance table is rebuilt with the structures every frame, so its slot carries the FRAME (heap_mask_instance_slot).
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) readonly buffer MaskInstances { MaskInstance instances[]; } mask_instances[];
+
+// The geometry's vertices and indices are read as untyped 4-byte words through their device addresses: the
+// engine's vertex is an implementation-defined interleaved record, so addressing it as floats is what makes the
+// offsets read `vec3 position; vec3 normal; vec2 uv` without depending on a std430 layout that does not exist.
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer MaskVertexFloats {
+    float values[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer MaskIndexWords {
+    uint values[];
+};
+
+/** @brief material_record::flags bit4 - "alphaMode MASK", the same bit shaders/surface.glsl tests */
+#define MASK_ALPHA_FLAG 16u
+/** @brief the uv's offset in the interleaved vertex, in floats: position(0-2) normal(3-5) uv(6-7) */
+#define MASK_UV_FLOAT_OFFSET 6u
+
+/** @brief the 64-bit device address held in two lanes (little-endian, low half first) */
+uint64_t mask_lane_address(uvec2 halves) {
+    return (uint64_t(halves.y) << 32u) | uint64_t(halves.x);
+}
+
+void main() {
+    const MaskInstance instance = mask_instances[heap_mask_instance_slot].instances[gl_InstanceCustomIndexEXT];
+    const MaskMaterial material = heap_material_tables[heap_slots_materials].materials[instance.material_index];
+    if ((material.flags & MASK_ALPHA_FLAG) == 0u) {
+        // OPAQUE or BLEND: the raster shadow pass does not cut those either, so the hit stands as it is.
+        return;
+    }
+
+    // The three vertices of the triangle the ray hit, by the geometry's own addressing: an index (or, for a
+    // non-indexed source - which is what the mask bake's expanded geometry is - the vertex's own position in
+    // the list), times the stride, off the base.
+    MaskVertexFloats vertices = MaskVertexFloats(mask_lane_address(instance.vertex_address));
+    const uint stride = instance.vertex_stride / 4u;
+    vec3 positions[3];
+    vec2 uvs[3];
+    for (uint k = 0u; k < 3u; ++k) {
+        const uint i = gl_PrimitiveID * 3u + k;
+        uint vertex = i;
+        if (instance.index_address != uvec2(0u)) {
+            MaskIndexWords indices = MaskIndexWords(mask_lane_address(instance.index_address));
+            if (instance.index_type == 0u) {
+                const uint word = indices.values[i >> 1u];
+                vertex = (i & 1u) == 0u ? (word & 0xFFFFu) : (word >> 16u);
+            } else {
+                vertex = indices.values[i];
+            }
+        }
+        const uint at = vertex * stride;
+        positions[k] = vec3(vertices.values[at + 0u], vertices.values[at + 1u], vertices.values[at + 2u]);
+        uvs[k] = vec2(vertices.values[at + MASK_UV_FLOAT_OFFSET + 0u], vertices.values[at + MASK_UV_FLOAT_OFFSET + 1u]);
+    }
+
+    // The hit's barycentric coordinates, computed in OBJECT space because that is the space the vertices are
+    // in: the ray is taken there by the traversal's own inverse transform. `gl_WorldToObjectEXT` is a mat4x3 -
+    // an affine transform stored as three columns of four - so it multiplies a vec4 and yields a vec3, which is
+    // also what makes the direction's translation drop out (w = 0) and leaves the parametric hit distance
+    // unchanged. Möller-Trumbore's u and v are the weights of vertices 1 and 2, which is what the interpolation
+    // below uses.
+    const vec3 origin_object = gl_WorldToObjectEXT * vec4(gl_WorldRayOriginEXT, 1.0);
+    const vec3 direction_object = gl_WorldToObjectEXT * vec4(gl_WorldRayDirectionEXT, 0.0);
+    const vec3 hit_point = origin_object + direction_object * gl_HitTEXT;
+    const vec3 edge_1 = positions[1] - positions[0];
+    const vec3 edge_2 = positions[2] - positions[0];
+    const vec3 pv = cross(direction_object, edge_2);
+    const float det = dot(edge_1, pv);
+    if (abs(det) < 1e-12) {
+        // A degenerate triangle has no UV frame to interpolate in. Committing the hit is the conservative
+        // answer: an unrefused hit keeps a shadow, while a wrong refusal deletes one.
+        return;
+    }
+    const float inv_det = 1.0 / det;
+    const vec3 tv = hit_point - positions[0];
+    const float u = dot(tv, pv) * inv_det;
+    const float v = dot(cross(tv, edge_1), direction_object) * inv_det;
+    const vec2 uv = uvs[0] * (1.0 - u - v) + uvs[1] * u + uvs[2] * v;
+
+    // THE CUT: the mirror of shaders/shadow.frag's discard and of shaders/surface.glsl's MASK test.
+    const float alpha = material.base_color_factor.a * textureLod(sampler2D(heap_textures[heap_slots_textures + material.tex_indices.x], heap_samplers[heap_sampler_texture]), uv, 0.0).a;
+    if (alpha < material.alpha_cutoff) {
+        ignoreIntersectionEXT;
+    }
+}

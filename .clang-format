@@ -1,0 +1,52 @@
+---
+# 项目统一代码风格配置（clang-format）
+# 用法：clang-format -i <file> 或 clang-format --dry-run -Werror <file>
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: Latest
+
+# 缩进：4 空格（与现有代码一致）
+IndentWidth: 4
+ContinuationIndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# 不强制列宽限制，保留现有长行（如 Vulkan 初始化代码）
+ColumnLimit: 0
+
+# 指针/引用贴合左侧类型（char* 而非 char *）
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+# 限定符统一为 east const（const T& -> T const&）
+QualifierAlignment: Right
+
+# 命名空间内容缩进 4 空格，访问限定符相对成员缩进 -4
+NamespaceIndentation: All
+AccessModifierOffset: -4
+
+# 花括号：贴在语句末尾（K&R 风格，与多数现有代码一致）
+BreakBeforeBraces: Attach
+
+# 函数体不压成单行
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+
+# 头文件排序：大小写敏感
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+
+# 二元/三元运算符换行风格
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: true
+
+# 构造初始化列表缩进
+ConstructorInitializerIndentWidth: 4
+BreakConstructorInitializers: BeforeComma
+
+# 其它
+SpacesInAngles: Never
+SpaceAfterCStyleCast: false
+IndentCaseLabels: false

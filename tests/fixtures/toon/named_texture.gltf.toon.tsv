@@ -1,0 +1,7 @@
+material	kind	name	value
+M_actor_test_body_01	slot	_BaseMap	T_actor_test_body_01_D
+M_actor_test_body_01	float	_UseBaseMap	1.0
+M_actor_test_body_01	slot	_DiffRampMap	T_actor_common_body_01_RD
+M_actor_test_body_01	float	_UseDiffRampMap	1.0
+M_actor_test_body_01	slot	_SpecRampMap	T_actor_absent_RS
+M_actor_test_body_01	float	_UseSpecRampMap	1.0

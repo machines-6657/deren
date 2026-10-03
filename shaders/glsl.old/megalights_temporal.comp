@@ -1,0 +1,241 @@
+#version 450
+
+/**
+ * @file shaders/megalights_temporal.comp
+ * @brief Temporal accumulation for the stochastic punctual lighting: a running mean with a frame count.
+ * @ingroup shaders
+ *
+ * WHY IT EXISTS: `shaders/megalights_trace.comp` answers with a few sampled lights per pixel, and one frame of
+ * that is an estimate rather than an image. What turns it into one is averaging DIFFERENT frames' samples,
+ * which is what this pass does - and the policy is Unreal's, taken from
+ * `docs/reference/megalights_stochastic_lighting.md` section 4:
+ *
+ *  1. A RUNNING MEAN rather than a fixed exponential weight: the accumulation is
+ *     `mix(clamped_history, current, 1 / frames)` where `frames` is a PER-PIXEL count that grows to a cap
+ *     (`MegaLightsDenoiserTemporal.usf:426-446`, and UE's cap is 12). A fixed 0.9 EMA - what this engine's GI
+ *     resolve uses - averages ten frames forever and cannot tell a pixel that has just appeared from one that
+ *     has been still for a hundred; a count can, and it is what makes the same pass handle both.
+ *  2. REJECTION before that, on two facts: the previous frame's accumulation for this pixel has to exist
+ *     (`frames > 0`), and the DEPTH the history comes from has to agree with this pixel's. The tolerance is
+ *     relative (the same absolute error means far less at 5 units than at 50) and it WIDENS at grazing angles,
+ *     where a sub-pixel reprojection error is a large depth difference: UE's
+ *     `abs(histDepth - reprojectedDepth) < reprojectedDepth * 0.03 / lerp(0.1, 1, saturate(N dot V))`
+ *     (`StochasticLightingTileClassification.usf:946-971`).
+ *  3. THE HISTORY IS CLAMPED into the current frame's neighbourhood statistics rather than into a min/max box:
+ *     the box is `mean +/- 2 * stddev` over the 3x3 of this frame's raw trace, expanded to contain the centre,
+ *     which is the same idea as the GI resolve's clamp with one difference that matters - a mean/stddev box is
+ *     not dragged around by a single outlier sample the way a min/max box is. UE additionally SOFTENS the
+ *     clamp by a per-pixel confidence and stores moments for its spatial pass; neither is here yet, and the
+ *     staging in docs/megalights.md says so.
+ *
+ * THE FRAME COUNT RIDES IN THE HISTORY'S ALPHA LANE. The trace's alpha carried the fraction of samples that
+ * found their light unblocked; this pass overwrites it with the count, because the count is what the NEXT
+ * frame's resolve needs and the unblocked fraction has no consumer yet. (UE keeps the count in an R8_UINT
+ * image of its own; an integer up to 2048 is exact in a float16, so the lane is free.)
+ *
+ * WHAT IT DOES NOT DO: no spatial filter (UE runs one after this, gated on the accumulated variance), no
+ * history rectification beyond the clamp, and no motion-vector dilation - `docs/megalights.md` stages those.
+ */
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The SHARED G-buffer set's depth (the rejections compare it) and motion vector (the history is reprojected with
+// it), and this pass's own two ends of the accumulation - all HEAP-NATIVE now (see docs/descriptor_heap_migration.md):
+// resource heap images, per SWAPCHAIN IMAGE, and every READ is an exact texel fetch (this pass works per pixel), so
+// the NEAREST sampler. The WRITE is a STORAGE image, so it uses the storage descriptor the grid reserves for that
+// image (heap_slots_ml_resolved_storage) - one image, two descriptors, because no single heap descriptor is both.
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#include "heap_slots.glsl"
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D gbuffer_depth_texture[];
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D velocity_texture[];
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D ml_trace_texture[];   // this frame's raw estimate (rgb, a = unblocked)
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D ml_history_texture[]; // last frame's accumulation (rgb, a = frame count)
+layout(descriptor_heap, descriptor_stride = heap_slot_stride, rgba16f) uniform image2D ml_resolved_image[];
+
+layout(push_constant) uniform MlTemporalPush {
+    // x = projection[2][2], y = projection[3][2] (the view-depth linearization pair, as in the tracer and the
+    // GI resolve), z = the frame-count cap, w = the history's relative depth tolerance (UE's 0.03).
+    vec4 params;
+    // xy = this pass's extent in texels, z = the spatial pre-filter's sigma (0 = off), w unused.
+    vec4 extents;
+    // THE HEAP INDICES (see heap_slots.glsl), at the END so every field above keeps its offset.
+    uint frame_slot;
+    uint image_index;
+} pc;
+#define heap_frame_slot (pc.frame_slot)
+#define heap_image_index (pc.image_index)
+
+/// @brief UE's `r.MegaLights.Temporal.MaxFramesAccumulated`: where a still pixel's running mean stops.
+const float ML_MAX_FRAMES = 12.0;
+/// @brief how many taps the neighbourhood statistics take: a 3x3, the same window the GI resolve clamps against.
+const int ML_CLAMP_RADIUS = 1;
+/// @brief the accumulated count a history is cut to when the reprojected depth disagrees (a soft rejection: the
+///        pixel keeps a short average instead of restarting from one raw frame - see the block in main).
+const float ML_DISAGREE_FRAMES = 2.0;
+/// @brief the spatial pre-filter's radius (a 3x3: the same window the clamp above uses - a wider one buys
+///        almost nothing, which is also why every other denoiser here settled on 3x3).
+const int SPATIAL_RADIUS = 1;
+
+/** @brief view-space distance of a depth-buffer value (the inversion every pass in this chain uses) */
+float view_depth(float z_ndc) {
+    return pc.params.y / (z_ndc + pc.params.x);
+}
+
+/**
+ * @brief the variance-weighted mean of this frame's estimate over a small neighbourhood
+ * @param uv this pixel's uv
+ * @param view_here its view distance, the depth guard's reference
+ * @return the filtered estimate, or this pixel's own value when every tap was rejected
+ *
+ * THE SPATIAL HALF of the denoise, and it runs BEFORE the accumulation rather than after it: filtering the
+ * accumulated image would need a second pass, a second image and a second descriptor family (UE does exactly
+ * that, and its spatial filter is `MegaLightsDenoiserSpatial.usf`), while filtering the frame's own estimate
+ * costs nothing here - the taps are already in registers and the accumulation is what then averages the
+ * result over time. The trade is stated rather than hidden: a pre-filter cannot use the accumulated moments
+ * as its variance estimate, so the variance it weighs by is the neighbourhood's own.
+ *
+ * The two weights are this chain's usual pair - a relative view-depth test and a spatial Gaussian - and the
+ * SIGMA comes from the push block, so 0 makes this function the identity and the whole thing an A/B.
+ */
+vec3 spatial_mean(vec2 uv, float view_here, float sigma) {
+    if (sigma <= 0.0) {
+        return heap_texel(ml_trace_texture[heap_slots_ml_trace + heap_image_index], heap_sampler_gbuffer, uv).rgb;
+    }
+    const vec2 texel = vec2(1.0) / vec2(pc.extents.xy);
+    const float depth_tolerance = max(0.02 * view_here, 1e-5);
+    const float inv_sigma2 = 1.0 / (2.0 * sigma * sigma);
+    vec3 sum = vec3(0.0);
+    float weight_sum = 0.0;
+    for (int y = -SPATIAL_RADIUS; y <= SPATIAL_RADIUS; ++y) {
+        for (int x = -SPATIAL_RADIUS; x <= SPATIAL_RADIUS; ++x) {
+            const vec2 offset = vec2(float(x), float(y));
+            const vec2 tap_uv = uv + offset * texel;
+            const float tap_depth = heap_texel(gbuffer_depth_texture[heap_slots_gbuffer_depth + heap_image_index], heap_sampler_gbuffer, tap_uv).r;
+            if (tap_depth >= 1.0) {
+                continue; // background: no estimate, and no depth to agree with
+            }
+            const float depth_weight = exp(-abs(view_depth(tap_depth) - view_here) / depth_tolerance);
+            const float spatial_weight = exp(-dot(offset, offset) * inv_sigma2);
+            const float weight = depth_weight * spatial_weight;
+            sum += heap_texel(ml_trace_texture[heap_slots_ml_trace + heap_image_index], heap_sampler_gbuffer, tap_uv).rgb * weight;
+            weight_sum += weight;
+        }
+    }
+    return weight_sum > 1e-5 ? sum / weight_sum : heap_texel(ml_trace_texture[heap_slots_ml_trace + heap_image_index], heap_sampler_gbuffer, uv).rgb;
+}
+
+void main() {
+    const ivec2 extent = ivec2(pc.extents.xy);
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= extent.x || pixel.y >= extent.y) {
+        return; // the dispatch is rounded up to the workgroup size
+    }
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+
+    const float depth_here = heap_texel(gbuffer_depth_texture[heap_slots_gbuffer_depth + heap_image_index], heap_sampler_gbuffer, uv).r;
+    // The estimate this frame contributes is the SPATIALLY filtered one (see spatial_mean): 0 disables it and
+    // leaves this line exactly what it was.
+    const vec3 current = spatial_mean(uv, view_depth(depth_here), pc.extents.z);
+    if (depth_here >= 1.0) {
+        // Background: the trace wrote 0 here, and so does this - with a count of 0, so that a pixel that gets
+        // geometry later starts its own accumulation rather than inheriting the sky's.
+        imageStore(ml_resolved_image[heap_slots_ml_resolved_storage + heap_image_index], pixel, vec4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    // ---- the reprojection and its rejection ----
+    const vec2 motion = heap_texel(velocity_texture[heap_slots_gbuffer_velocity + heap_image_index], heap_sampler_gbuffer, uv).rg;
+    const vec2 previous_uv = uv - motion;
+    const float view_here = view_depth(depth_here);
+    float frames = 0.0;
+    vec3 history = vec3(0.0);
+    if (previous_uv.x >= 0.0 && previous_uv.x <= 1.0 && previous_uv.y >= 0.0 && previous_uv.y <= 1.0) {
+        const vec4 fetched = heap_texel(ml_history_texture[heap_slots_ml_history + heap_image_index], heap_sampler_gbuffer, previous_uv);
+        frames = fetched.a; // the frame count, which is 0 for a pixel with no accumulation
+        const float previous_depth = heap_texel(gbuffer_depth_texture[heap_slots_gbuffer_depth + heap_image_index], heap_sampler_gbuffer, previous_uv).r;
+        // The grazing widening needs a surface normal, and this pass reads none: the G-buffer's normal is a
+        // target this chain deliberately does not bind (see the binding comment). A constant 1 divides the
+        // tolerance by the loose factor, i.e. this is UE's test with its `lerp` fixed at its loosest - the
+        // conservative direction, which costs history rather than granting a stale one. Binding the normal to
+        // sharpen it is a change with its own measurement, not an assumption here.
+        const float tolerance = max(previous_depth < 1.0 ? pc.params.w * view_here : -1.0, -1.0);
+        const bool depth_agrees = previous_depth < 1.0 && abs(view_depth(previous_depth) - view_here) <= tolerance;
+        // ---- A SOFT REJECTION, AND THE REASON IS THE ONE THING THAT EXPLAINED THE FLICKER ----
+        //
+        // The hard version (drop the history and restart at one frame) is what this pass used to do, and it made
+        // the chain show its RAW per-frame estimate at exactly the pixels where TAA's jitter matters most: a pixel
+        // whose sub-pixel sample lands on a different surface this frame - a silhouette, a thin relief, a contact
+        // shadow's sub-pixel boundary - gets a different G-buffer position and normal, so its reprojected depth
+        // disagrees and the accumulation restarted EVERY frame. TAA resolves that same jitter by integrating it,
+        // which is why the unshadowed control moves ~2/255 at those pixels while the chain moved up to 45.
+        //
+        // Measured, before this change, at the pixels the flicker map calls hot: one sample per pixel is as
+        // stable as four (so it is not sampling noise), the history's depth tolerance makes no difference between
+        // 0.03 and 1.0 (so it is not the test's sharpness), the spatial pre-filter and the lighting stage's
+        // bilateral upsample make no difference either (so it is not the filtering), and an emitter with an
+        // angular size - soft shadows - makes no difference (a CONTACT shadow has no penumbra to widen, whatever
+        // the emitter's size). What is left is the input changing, and the answer is to average through it the
+        // way TAA does rather than to discard it.
+        //
+        // So a disagreeing history is KEPT but its accumulated count is cut to ML_DISAGREE_FRAMES: the pixel keeps
+        // a short average (which is what damps a per-frame flip) while staying responsive, and the neighbourhood
+        // clamp below is what bounds how far a history from the other surface may pull it.
+        if (frames > 0.0) {
+            history = fetched.rgb;
+            if (!depth_agrees) {
+                frames = min(frames, ML_DISAGREE_FRAMES);
+            }
+        } else {
+            frames = 0.0;
+            history = vec3(0.0);
+        }
+    }
+
+    // ---- the neighbourhood statistics over THIS frame's trace ----
+    vec3 sum = vec3(0.0);
+    vec3 sum_squared = vec3(0.0);
+    float taps = 0.0;
+    // THE TAP STRIDE IS THIS PASS's texel, and it was the full-resolution one until the spatial pre-filter made
+    // the bug visible: `extents.zw` is the FULL extent, so a 3x3 at that stride took its taps a quarter of a GI
+    // texel apart - i.e. four taps inside one texel's worth of signal, which is not a neighbourhood at all.
+    const vec2 texel = vec2(1.0) / vec2(pc.extents.xy);
+    for (int y = -ML_CLAMP_RADIUS; y <= ML_CLAMP_RADIUS; ++y) {
+        for (int x = -ML_CLAMP_RADIUS; x <= ML_CLAMP_RADIUS; ++x) {
+            const vec2 tap_uv = uv + vec2(float(x), float(y)) * texel;
+            const float tap_depth = heap_texel(gbuffer_depth_texture[heap_slots_gbuffer_depth + heap_image_index], heap_sampler_gbuffer, tap_uv).r;
+            if (tap_depth >= 1.0) {
+                continue; // a background tap holds no estimate
+            }
+            const vec3 tap = heap_texel(ml_trace_texture[heap_slots_ml_trace + heap_image_index], heap_sampler_gbuffer, tap_uv).rgb;
+            sum += tap;
+            sum_squared += tap * tap;
+            taps += 1.0;
+        }
+    }
+    // A mean/stddev box, expanded to contain the centre (which the taps may have rejected), and then the
+    // accumulated history pulled into it - UE's `mean +/- clampScale * stddev` with a clampScale of 2.
+    vec3 box_min = current;
+    vec3 box_max = current;
+    if (taps > 0.0) {
+        const vec3 mean = sum / taps;
+        const vec3 variance = max(sum_squared / taps - mean * mean, vec3(0.0));
+        box_min = min(box_min, mean - 2.0 * sqrt(variance));
+        box_max = max(box_max, mean + 2.0 * sqrt(variance));
+    }
+    history = clamp(history, box_min, box_max);
+
+    // ---- the running mean ----
+    const float cap = max(pc.params.z, 1.0);
+    const float next_frames = min(frames + 1.0, cap);
+    const float alpha = 1.0 / next_frames;
+    vec3 resolved = mix(history, current, alpha);
+    // A NaN or an infinity anywhere in the chain (a degenerate light, a zero-length ray) must not be
+    // accumulated: it would poison the pixel for as long as the history survives.
+    if (any(isnan(resolved)) || any(isinf(resolved))) {
+        resolved = current;
+        imageStore(ml_resolved_image[heap_slots_ml_resolved_storage + heap_image_index], pixel, vec4(0.0, 0.0, 0.0, 0.0)); // ... and the accumulation restarts
+        return;
+    }
+    imageStore(ml_resolved_image[heap_slots_ml_resolved_storage + heap_image_index], pixel, vec4(max(resolved, vec3(0.0)), next_frames));
+}

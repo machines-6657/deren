@@ -1,0 +1,4 @@
+# fixture: the model ASK sentinel (see app_config::wants_model_dialog) - the config's way of saying
+# "open the platform's file dialog at startup". This file carries exactly one key, so the test that
+# loads it also pins that every absent key keeps its compiled-in default.
+model = "ask"

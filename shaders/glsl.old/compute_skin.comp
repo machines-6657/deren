@@ -1,0 +1,128 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+/**
+ * @file shaders/compute_skin.comp
+ * @brief Skin a primitive's vertices into the buffer its acceleration structure is built from.
+ * @ingroup shaders
+ *
+ * WHY THIS EXISTS. This engine skins in the VERTEX shader (`shaders/pbr.vert`), which is where a
+ * deformation belongs for rasterisation - and which means the deformed positions never exist in memory an
+ * acceleration structure build can read. So a skinned mesh's ray-traced shadow is its BIND POSE, a
+ * limitation documented since the ray-traced shadows were added and measured before this pass was written
+ * (the traced shadow's pose dependence is zero where the raster one's is up to 3.8 per tile). A compute pass writing the SAME vertex positions the vertex shader
+ * computes removes the difference at its source: the structure is then built from, and refitted against,
+ * the deformed geometry.
+ *
+ * THE MATHS IS COPIED FROM THE VERTEX SHADER DELIBERATELY, term for term (`shaders/pbr.vert`'s main): the
+ * four joint matrices are blended by the vertex's weights and divided by their sum, positions as
+ * `mat4 * vec4(p, 1)` and normals by the matrices' rotation part, with the identity block at joint base 0
+ * leaving unskinned vertices alone. Two implementations of one deformation that disagree would show up as
+ * a shadow that does not match its object, which is exactly what this feature exists to fix - so if that
+ * maths changes there, it has to change here.
+ *
+ * WHAT IT DOES NOT DO: morph targets. They are the step before skinning in the vertex shader, and this
+ * pass reads only the position/normal/UV and the joints/weights - a morphable mesh still traces its
+ * UNMORPHED pose (the same shape of limitation, one property over). Folding them in needs the morph
+ * deltas and their active weights, which live at the scene set's binding 10.
+ *
+ * THE OUTPUT KEEPS THE SOURCE'S VERTEX ORDER, one 32-byte record per VERTEX (position, normal, UV), so the
+ * primitive's own index buffer stays valid and the structure keeps its triangle count - which is what
+ * makes a REFIT (rather than a rebuild) possible: the geometry's addresses and counts never change, only
+ * the bytes behind them.
+ */
+
+layout(local_size_x = 64) in;
+
+// The scene set's per-joint matrices (binding 9), HEAP-NATIVE now: the array IS the heap and the slot carries the
+// FRAME (the runtime writes one per frame slot), so a read is `skins[heap_skin_slot].matrices[...]`. Declared here
+// because this pass includes no shared header that owns it; the grid header brings the slots and the extensions.
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#include "heap_slots.glsl"
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) readonly buffer SkinMatrices { mat4 matrices[]; } skins[];
+
+layout(push_constant) uniform SkinPush {
+    // Device addresses as two 32-bit halves, the shape every pass in this project pushes them in.
+    uvec2 source_vertices;
+    uvec2 destination;
+    uint source_stride;      // the source's byte stride (64: the engine's interleaved vertex)
+    uint destination_stride; // 32: position(3) + normal(3) + uv(2), what hit shading reads
+    uint vertex_count;
+    uint skin_base; // this primitive's joint block in skins.matrices (0 = the identity block)
+    // THE HEAP INDICES (see heap_slots.glsl), at the END so every field above keeps its offset.
+    uint frame_slot;
+    uint image_index;
+} pc;
+#define heap_frame_slot (pc.frame_slot)
+#define heap_image_index (pc.image_index)
+
+/** @brief the 64-bit device address held in two push lanes
+ *  @note the parameter's qualifier is LEADING: glslc rejects a trailing `const` on a declaration */
+uint64_t lane_address(uvec2 halves) {
+    return (uint64_t(halves.y) << 32u) | uint64_t(halves.x);
+}
+
+// The source is the engine's interleaved vertex, read as untyped words: floats for the first eight (the
+// offsets 0, 3 and 6 are position, normal and UV) and uints for the joints, which sit at byte 32 of a
+// 64-byte record (shaders/pbr.vert declares them as location 4, a uvec4; the weights follow at byte 48).
+// THOSE TWO OFFSETS ARE THE LAYOUT'S, NOT THE STRIDE'S: pc.source_stride scales which vertex is read, and
+// the caller only ever hands this pass a caster whose stride IS 64 - a mesh whose vertex layout changed
+// would need this shader changed with it, and the caller refuses it instead (see the stride test in
+// runtime::record_acceleration_structures) so a wrong deformation cannot be written silently.
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SkinSource { uint values[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer SkinDest { float values[]; };
+
+void main() {
+    const uint vertex = gl_GlobalInvocationID.x;
+    if (vertex >= pc.vertex_count) {
+        return; // the dispatch is rounded up to the workgroup size
+    }
+    const uint64_t source_base = lane_address(pc.source_vertices);
+    SkinSource source = SkinSource(source_base);
+    const uint at = vertex * (pc.source_stride / 4u);
+    const vec3 position = vec3(uintBitsToFloat(source.values[at + 0u]), uintBitsToFloat(source.values[at + 1u]), uintBitsToFloat(source.values[at + 2u]));
+    const vec3 normal = vec3(uintBitsToFloat(source.values[at + 3u]), uintBitsToFloat(source.values[at + 4u]), uintBitsToFloat(source.values[at + 5u]));
+    const vec2 uv = vec2(uintBitsToFloat(source.values[at + 6u]), uintBitsToFloat(source.values[at + 7u]));
+
+    // The joints are read through their OWN reference at the vertex's byte 32: a word view rather than a
+    // float one, because a joint index is an integer and reinterpreting it as a float and back is the kind
+    // of round trip that works until an index lands in a signaling NaN bit pattern.
+    SkinSource joint_words = SkinSource(source_base + 32u + uint64_t(at) * 4u);
+    const uvec4 joints = uvec4(joint_words.values[0], joint_words.values[1], joint_words.values[2], joint_words.values[3]);
+    const vec4 weights = vec4(uintBitsToFloat(source.values[at + 12u]), uintBitsToFloat(source.values[at + 13u]), uintBitsToFloat(source.values[at + 14u]), uintBitsToFloat(source.values[at + 15u]));
+
+    const vec4 local = vec4(position, 1.0);
+    vec3 skinned_position = position;
+    vec3 skinned_normal = normal;
+    const float weight_sum = weights.x + weights.y + weights.z + weights.w;
+    if (weight_sum > 0.0) {
+        vec4 blended = vec4(0.0);
+        vec3 blended_normal = vec3(0.0);
+        blended += weights.x * (skins[heap_skin_slot].matrices[pc.skin_base + joints.x] * local);
+        blended += weights.y * (skins[heap_skin_slot].matrices[pc.skin_base + joints.y] * local);
+        blended += weights.z * (skins[heap_skin_slot].matrices[pc.skin_base + joints.z] * local);
+        blended += weights.w * (skins[heap_skin_slot].matrices[pc.skin_base + joints.w] * local);
+        blended_normal += weights.x * mat3(skins[heap_skin_slot].matrices[pc.skin_base + joints.x]) * normal;
+        blended_normal += weights.y * mat3(skins[heap_skin_slot].matrices[pc.skin_base + joints.y]) * normal;
+        blended_normal += weights.z * mat3(skins[heap_skin_slot].matrices[pc.skin_base + joints.z]) * normal;
+        blended_normal += weights.w * mat3(skins[heap_skin_slot].matrices[pc.skin_base + joints.w]) * normal;
+        skinned_position = (blended / weight_sum).xyz;
+        skinned_normal = blended_normal / weight_sum;
+    }
+
+    // OBJECT space, not world: the structures are built from object-space vertices and the instance carries
+    // the object-to-world matrix (the same division of labour the unskinned path has, where the build reads
+    // the primitive's own vertex buffer).
+    SkinDest destination = SkinDest(lane_address(pc.destination));
+    const uint out_at = vertex * (pc.destination_stride / 4u);
+    destination.values[out_at + 0u] = skinned_position.x;
+    destination.values[out_at + 1u] = skinned_position.y;
+    destination.values[out_at + 2u] = skinned_position.z;
+    destination.values[out_at + 3u] = skinned_normal.x;
+    destination.values[out_at + 4u] = skinned_normal.y;
+    destination.values[out_at + 5u] = skinned_normal.z;
+    destination.values[out_at + 6u] = uv.x;
+    destination.values[out_at + 7u] = uv.y;
+}

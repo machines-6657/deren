@@ -1,0 +1,638 @@
+# ============================================================
+# deren startup configuration (example)
+# ------------------------------------------------------------
+# Copy this file to config.toml (in the working directory, or anywhere
+# and point to it with --config <path>), then adjust as needed.
+#
+#   cp config.example.toml config.toml
+#   deren                    # reads config.toml
+#   deren --config my.toml   # reads the given file
+#   deren <model>            # argv overrides the file entries
+#
+# Note: backslashes are escapes in TOML strings, so use forward slashes
+# for Windows paths ("C:/...") or double backslashes ("C:\\...").
+# ============================================================
+
+# ---- top level: model to load ----
+# model: glTF/GLB file to load. When empty, tries DamagedHelmet.gltf under
+#   paths.model_dir, then auto-locates gltf_model/ upward from the cwd.
+#   The value "ask" (exactly, case-sensitive) opens the platform's own file dialog at startup instead:
+#   GetOpenFileNameW on Windows, zenity/kdialog on Linux, osascript on macOS. Cancelling it, or running
+#   where no dialog backend exists, is NOT an error - the app falls back to the default model above, so
+#   an unattended run still starts. A positional argv model path overrides this key, dialog and all.
+model = "gltf_model/DamagedHelmet.gltf"
+
+# grid_side: when > 1, lays the first pbr model out as a grid_side x grid_side
+#   instanced grid (single instanced draw call stress test; 0 = off)
+grid_side = 0
+
+# ---- [paths] resource directories (empty = auto-locate) ----
+[paths]
+# shaders_dir: shader SPIR-V directory. Empty = find "shaders/" upward from cwd.
+shaders_dir = ""
+
+# model_dir: default model directory used when model is empty (looks for
+#   DamagedHelmet.gltf inside). Empty = auto-locate "gltf_model/" upward.
+model_dir = ""
+
+# screenshot_dir: base directory for F12 screenshots (created on demand).
+#   Empty = the current working directory.
+screenshot_dir = ""
+
+# ---- [render] window / presentation ----
+[render]
+# Initial window size in pixels; the window is resizable, resizing rebuilds the
+# swapchain automatically.
+window_width  = 1080
+window_height = 960
+
+# Window title (static; fps is shown in the ImGui overlay when gui is enabled).
+window_title = "deren"
+
+# vsync: true = prefer FIFO_LATEST_READY (vsync-locked, never tears, and the acquire blocks instead of
+# spinning, so an idle window stays off the CPU; falls back to FIFO where that extension is missing).
+# false = prefer Mailbox, which presents as fast as the app can render: that is the mode to measure
+# throughput in, because with vsync the presented rate is the display's refresh rate and only the
+# per-pass CPU/GPU timing lines say anything about the renderer.
+vsync = true
+# max_fps: cap the render loop. 0 = uncapped, which is what a throughput (fps) measurement needs -
+# with vsync on the displayed rate is the refresh rate either way, but the loop still runs flat out and
+# burns a core, so a desktop build usually wants something like the display's refresh rate here while a
+# benchmark wants 0. Capture runs (--capture-frames) also want 0.
+max_fps = 0
+
+# clear_color: per-frame background clear color (RGB, 0..1). The lighting stage writes the sky into
+#   every pixel no geometry covered, so this only shows where that stage does not run at all.
+clear_color = [0.02, 0.02, 0.03]
+
+# camera_fit: how the orbit camera is aimed at the scene when it loads.
+#   "exterior" (default) fits the whole model from outside - 2.75 scene radii, which is right for a
+#     compact object such as DamagedHelmet.
+#   "interior" stands INSIDE the scene and looks along its longest horizontal axis, because that is
+#     the axis a hall, nave or corridor runs down (for Sponza: 29.8 x 18.3 in the ground plane, so
+#     the look direction ends up +X). The distance is a fraction of the smaller horizontal
+#     half-extent, which keeps the eye inside even a narrow hall.
+#   A building framed from outside is a facade and nothing else. That is fine for a model viewer and
+#   useless for global illumination, where the whole point is to see light bounce around an interior
+#   - so use "interior" for Sponza and any other scene you mean to stand in.
+#   The startup log prints the pose this resolves to ("initial camera: fit=... yaw ... distance ..."),
+#   and --capture-camera pins an exact pose on top of either mode.
+camera_fit = "exterior"
+
+# camera_pose: pin the orbit camera exactly - `[yaw, pitch, distance, targetX, targetY, targetZ]`, the same six
+# numbers `--capture-camera` takes and the same six the log prints on exit, so a view can be pasted between them,
+# written into a config to make a bare run reproduce it, or reported by a user. ABSENT here on purpose: absent
+# leaves `camera_fit` in charge, and `--capture-camera` overrides either.
+#
+#   THE TARGET IS THE POINT THE ORBIT ROTATES ABOUT, which is what makes this worth setting for a character.
+#   Point it at the HEAD and the mouse orbits the head; leave it on the body centre and a few degrees of pitch
+#   swings the head straight out of a close-up (measured: at distance 0.45, 15 degrees of pitch moved the face
+#   about 500 px - enough that "look at the eyes from another angle" was not possible without re-aiming).
+#
+#   THE HEAD'S NUMBER IS ARITHMETIC, NOT TASTE. main.cpp shifts the model by `-scene_center + scene_sink` with
+#   `scene_sink = (0, -scene_radius, 0)`, so the model's CENTRE lands at `y = -scene_radius` and a camera_pose
+#   target is in THAT sunk space:
+#       target_y = head_model_y - scene_radius
+#   Both numbers are in the startup log's `scene bounds (aabb)` line. For `chen.glb` (`max.y` 1.780, radius
+#   1.092, iris mesh at model y 1.51) that is `1.56 - 1.092 = +0.47` below the origin, i.e. target y -0.47, and
+#   distance 1.0 frames head and shoulders. Measured with that pose: the head stays centred and in frame at
+#   pitch -25, 0, +25, +45 and at yaw +/-35 with pitch +/-15.
+#
+# camera_pose = [0.0, 0.0, 1.0, 0.0, -0.47, 0.0]
+
+# animation_time: pin the keyframe animation at this time in SECONDS, or -1 (the default) to play it. Only
+# matters for a model that carries animations, which the demo plays automatically on a loop.
+# WHY IT EXISTS: playback is driven by the WALL CLOCK (frame_clock::delta_seconds), so the pose at a given
+# frame count differs from run to run - measured: two runs of one animated config at 60 frames produced
+# different images (their means agreed to four decimals, the pixels did not). Anything that compares two
+# captures of one pose therefore needs the time fixed, and the skinned-mesh ray-tracing work is the first
+# thing that does. It scrubs and pauses, exactly like the debug overlay's time slider, so the pose is a
+# function of this value alone and a capture becomes reproducible. -1 is a no-op: the frame is what it was.
+animation_time = -1.0
+
+# shadow: record the directional shadow pass each frame (false = no shadows, fully lit)
+shadow = true
+
+# shadow_cascades: how many cascaded shadow maps the sun uses (1..4). One map cannot be dense enough
+# for both the near range and the far one: a single 2048^2 map fitted to a whole scene gives every
+# receiver the same texel size, so with the box fitted to the camera view the pixels close to the
+# camera get the same coarse texels as the ones far away. The fitted view range is split into this
+# many slices (practical split scheme, lambda 0.75), each cascade gets the same map resolution over a
+# much smaller footprint, and the fragment shader picks its cascade per pixel from the view depth
+# (blending across the boundary over `shadow_cascade_blend` of the range - a hard switch shows the
+# resolution step as a line). 1 = exactly the historic single-map behavior; 3 is the default balance,
+# 4 spends the sharpest near range on 4x the shadow memory (the map is a 4-layer array whatever this
+# says - a runtime-selectable count needs the layers to exist up front). Applied before the scene
+# import: the layered image is created when the first scene set binds it.
+shadow_cascades = 3
+
+# shadow_map_size: the shadow map's edge length in texels (256..8192, rounded to a power of two).
+# 2048 is the default: the layered map is shadow_map_size^2 x 4 cascade layers x 4 bytes per frame
+# slot, so 2048 costs 64 MB per slot and 4096 would cost 256 MB - and the depth pass scans that many
+# texels per cascade per frame. Halving it quarters both and doubles the shadow texel size (a softer,
+# more aliased edge); `[render] shadow_cascades` is usually the better knob to spend resolution on.
+# STARTUP-ONLY, like the cascade count: the image, its per-layer views and the descriptor are created
+# when the first scene set binds them, so this must apply before the scene import.
+shadow_map_size = 2048
+
+# shadow_cascade_blend: fraction of a cascade's range over which it fades into the next one
+# (0.1 = the last 10% of the range). 0 = a hard switch.
+shadow_cascade_blend = 0.1
+
+# toon_shadow_softness: how wide the TOON chain's shadow lookup is, as a five-step ladder. It is written to
+# the character stage's light rig (`deren::vulkan::toon_rig`'s ninth lane) and read by exactly one call site - the
+# shadow lookup inside `toon_diffuse` (`shaders/character_forward.slang`). That body is SHARED: the same
+# file's entry point, `shaders/outline.slang` and `shaders/goo_toon.slang` (which includes
+# `character_forward.slang` for the rewritten chain) all call it, so at 1..4 the wide lookup is compiled
+# into and used by those three stages. `shaders/goo_toon.slang`'s OWN shadow read (its `rs_shadow`, the bare
+# `calc_shadow`) is untouched by every level, and the deferred/PBR paths never see the value at all.
+# 0 = OFF, the default, and byte-identical to a run without the key: `calc_shadow_soft(0)` calls the shipped
+# `calc_shadow` and nothing else - the same 3x3 grid of hardware 2x2 comparison taps that the shipped comment
+# in `shaders/shading.glsl` already documents as a "4x4 texel footprint" (9 taps), not a new path.
+# 1..4 widen the UNROTATED tap grid: taps spaced `spacing` texels apart, running `half` texels either way, so
+# the tap count is `(2*half + 1)^2` = 9 / 25 / 49 / 121 / 289. THE WIDTH COLUMN BELOW IS THE SPAN OF TEXEL
+# INDICES THE TAPS REACH, first and last included - the counting the shipped "4x4" uses: each hardware
+# comparison tap carries its own 2x2 texel footprint and its centre sits within `half*spacing` texels of the
+# sample uv, so the span is `2*half*spacing + 2` (the CONTINUOUS COVERED WIDTH is one texel less,
+# `2*half*spacing + 1`; the two must not be mixed up):
+#   level  (half, spacing)  taps       texel span (2*half*spacing + 2)
+#   0      (1, 1)           3x3   = 9    4   (the shipped lookup, not a new path)
+#   1      (2, 2)           5x5   = 25  10
+#   2      (3, 3)           7x7   = 49  20
+#   3      (5, 4)           11x11 = 121 42
+#   4      (8, 3)           17x17 = 289 50
+# MEASURED on the shoulder seam's ROI (camera A, ROI (216,416)-(406,596), skin mask erode4 = 34,571 px) on the
+# currently shipped welded asset. "steps" counts ROI skin pixels whose luma moved by at least 8 (or 17) code
+# values - the hard comb teeth in the shadow's termination; "brighter"/"darker" is the share of ROI skin pixels
+# that moved that far, one way; luma is the ROI skin's mean. Level 0 is the reference (the shipped lookup):
+#   level  steps>=8  steps>=17  mean luma  brighter>8  brighter>32  darker>8  marginal frame cost
+#   0       1,641     768        170.77     0 %         0 %          0 %       10.46 ms
+#   1         998      93        174.19     9.06 %      3.08 %       0.23 %    not measured
+#   2         429       0        175.80    18.48 %      7.90 %       1.19 %    not measured
+#   3          79       0        177.32    28.34 %     15.93 %       3.68 %    not measured
+#   4          79       0        177.61    29.94 %     17.44 %       4.42 %    11.69 ms (+11.8 %)
+# THESE FIVE NUMBERS ARE THE SHIPPED SAMPLE - the pinned values this example ships, not a live measurement.
+# `config.example.toml` is a template and `tests/test_app_config.cpp` parses it value by value, so keep the
+# numbers as fixtures and only change them together with a re-measurement. Every cell above, the ROI and the
+# erode4 mask were taken on the asset that ships in this tree:
+#   chars/laevatain_goo.glb  63,835,728 B
+#   sha256 CE313E4D9515BC1887B4E0C783ABEA66A70FBFFF69ABD18992BDF33C8F5606F9
+# This block is the AUTHORITY for the cost table: the two headers that describe the field
+# (`application_configuration/application_configuration.cppm`, `vulkan/primitive/primitive.cppm`) repeat no
+# number and point here instead, precisely because a copy of the table went stale twice.
+# The background changed by exactly 0 pixels in all three camera positions at every level, so the ladder only
+# touches the character. Levels 3 and 4 leave the same 79 hard steps: within this ROI 4 buys no extra
+# termination, it is merely softer elsewhere (more mean lift, more leak) - so do not read this ROI as "4 is
+# better than 3". The marginal cost is `(t120 - t40) / 80`, one extra frame's worth at that level; 10.46 ->
+# 11.69 ms is +11.8 % and sub-linear because the five levels already saturate this ROI. Level 3's own cost was
+# NOT measured, so nothing here may be interpolated between 0 and 4.
+# So stronger = fewer hard comb teeth at the shadow's edge AND more light leaking onto the lit skin - a taste
+# trade, which is why the default is off. Float or integer; a non-integer is rounded, anything outside 0..4 is
+# clamped, `nan` is read as 0, and each case is logged at startup with its own line. The inner loops are
+# dynamic, so the GPU cost of 1, 2 and 3 is NOT measured either.
+toon_shadow_softness = 0
+
+# shadow_bias_constant / shadow_bias_slope: the rasterization depth bias the shadow pass applies to a
+# caster's depth, which is what stops a lit surface from shadowing itself. These are the runtime's own
+# defaults, so omitting them changes nothing; `slope` scales with the depth gradient and is the one that
+# usually matters, `constant` is a flat offset. The debug GUI exposes the same two as sliders, and moving
+# them there overrides whatever the config said.
+shadow_bias_constant = 0.0
+shadow_bias_slope = 1.5
+
+# clustered_lights: sort the punctual lights into a screen-tile x depth-slice grid once per frame (a
+# compute pass, shaders/light_cluster.slang) and evaluate only the pixel own cluster list instead of
+# every active light. This is what makes a light count far past the old four affordable: measured on
+# Sponza with 64 procedural lights at 960x720, the shading pass drops from 1.28 ms to 0.44 ms (and the
+# same change measured 0.25 ms to 0.08 ms in the pre-M5 forward path), with a byte-identical image.
+# false = the brute-force loop over every active light (the reference path the clustered one is
+# verified against). The grid is 64 px tiles x 16 exponential depth slices, 32 lights per cluster;
+# a cluster that overflows drops the extra lights (raise deren::vulkan::cluster_light_capacity if a scene
+# ever needs more - the capacity and the light array size are the two knobs).
+clustered_lights = true
+
+# ssao / ssao_radius / ssao_intensity / ssao_samples: screen-space ambient occlusion (M6). The
+# lighting stage traces a golden-angle hemisphere of samples around each pixel
+# against the G-buffer depth and folds the occlusion into the shade_input ao, which is exactly what a
+# material baked AO map does: it scales the IBL ambient (diffuse and specular) and never the direct
+# sun. No extra pass and no extra render target - the depth and normals it needs are the G-buffer the
+# lighting stage already reads. The radius is in WORLD units, so its apparent strength depends on how
+# close the camera is: 0.5 suits human-scale contact AO, while Sponza seen from 50 units away needs
+# 1..2 to read (that distance dependence is inherent to screen-space AO, not a tuning mistake), and
+# `ssao_samples` trades cost for smoothness (1..16, the shader maximum). `ssao = false` (or an
+# intensity of 0) makes the term return exactly 1.0, so the frame is bit for bit the pre-M6 frame.
+# It scales the IBL ambient (diffuse and specular) and never the direct sun, and it is applied to the
+# material's baked AO rather than replacing it.
+ssao = true
+ssao_radius = 0.5
+ssao_intensity = 1.0
+ssao_samples = 8
+# furnace: VERIFICATION mode, not a look. The sun is turned off and the environment becomes a constant
+# level L, which makes the correct frame computable by hand: a diffuse surface's outgoing radiance is
+# then exactly albedo * L. On a convex object that identity is an exact acceptance test (measured: 122
+# of 1036800 pixels off by one 8-bit step). Its premise is narrower than it looks - the incident
+# radiance has to be L from EVERY direction, which is false inside a building (a ray that lands on a
+# wall comes back with the wall's radiance, not L) - so its acceptance is an exactness test on a scene
+# whose premise holds, rather than a general reference. Off by default, and off is byte-exact.
+furnace = false
+# rt_shadows: ray-traced sun shadows. One ray per pixel against the scene's acceleration structures,
+# which is what makes contact shadows, cascade seams and the resolution limit of a shadow map go away -
+# and what removes the "all or nothing" bias tuning a depth map needs. It is granted only on a device
+# with ray queries (`VK_KHR_acceleration_structure` + `VK_KHR_ray_query`); everywhere else the key is
+# ignored and the cascaded maps run, so it is safe to leave in a shared config.
+#
+# Turning this on builds the scene's acceleration structures and traces the sun with them. Measured on
+# Sponza at 1080x960 (the per-pass GPU timings, the "rt" and "rt shadow" intervals): the bottom levels are
+# built once (103 structures, 262k triangles, 17.8 MiB, ~2 ms host), the top level is rebuilt every frame
+# from the culled caster list (103 instances, 0.09-0.14 ms), and the rays themselves cost 1.06-1.22 ms per
+# frame - so the frame goes from ~0.9 ms to ~2.4 ms. That is the honest price of the feature and the
+# reason it is opt-in: the cascaded path is nearly free here (~0 ms) because a static scene REUSES its
+# shadow maps (M9), while a ray has to re-answer the question every frame.
+#
+# What it buys is shadow detail a cascade map cannot represent: against the cascade path the frame differs
+# by 4.56/255 on average, and the differences are thin bands on shadow edges - a hard ray against hardware
+# PCF - plus the crenellated parapet's shadow on the upper wall, where the 2048 map smears the merlons
+# into one band (raising the map to 8192 only sharpens the band; the ray resolves each merlon, verified by
+# comparing the three side by side).
+#
+# One limit comes with it, which the next key addresses: a skinned or morphed mesh casts its BIND POSE (the
+# deformation happens in the vertex shader and never reaches the memory a build reads) unless `rt_skin_bake`
+# is on. The other limit a traced shadow used to have - alphaMode MASK geometry being SOLID to the ray,
+# because an inline ray query has no any-hit stage to run the material's discard - is GONE: the shadow runs
+# on a ray-tracing PIPELINE whose hit group carries an any-hit shader that fetches the hit's own UV, samples
+# the material's alpha and refuses the intersection below the cutoff (shaders/rt_shadow.rahit). `rt_mask_bake`
+# below is the older, worse substitute for that stage and stays only as an A/B instrument.
+rt_shadows = false
+# rt_mask_bake: bake alphaMode MASK into the acceleration structures, so a masked surface is not SOLID to a
+# ray. THIS IS THE SUBSTITUTE FOR AN ANY-HIT STAGE, and the shipped path does not need it: the ray-tracing
+# pipeline's any-hit shader answers the same question per HIT rather than per triangle (shaders/rt_shadow.rahit
+# fetches the hit's own UV, samples the material's alpha and refuses the intersection below the cutoff; measured
+# on the AlphaBlendModeTest asset it lands 3.0/255 from the raster shadow over the pixels it changes, against
+# 136.6/255 without it). What is left here is the A/B arm of that comparison.
+# A compute pass (`shaders/mask_bake.slang`) samples the material's alpha over each triangle of masked
+# geometry and COLLAPSES the triangles the mask covers nowhere - all three of their vertices written at one
+# position, which is a triangle no traversal can report a hit against. Hiding a triangle that way is only
+# safe if it owns its vertices, so the geometry is expanded to three unique vertices per triangle, made
+# non-indexed, written into a buffer of its own, and the structures and the hit shading read that copy.
+# OFF BY DEFAULT, AND THE MEASUREMENT IS WHY - this is an instrument, not a fix that worked. The plumbing is
+# verified (baking with the rule disabled is byte-identical to not baking at all: the expansion, the
+# non-indexed build and the instance table are all exact), but the RULE is a per-triangle decision standing
+# in for a per-fragment one, and on a MASK-heavy sample asset it disagrees with the raster path in the
+# expensive direction: the traced frame came out 1.29 of mean brightness BRIGHTER than the raster shadow it
+# should match, i.e. triangles the raster path still shadows (through its own filtered texel sampling) were
+# removed from the structure. The rule samples every texel of a triangle's UV footprint and keeps anything
+# it cannot walk, so it does not remove geometry it has not looked at - what it cannot do is reproduce a
+# PER-PIXEL mask, which is exactly the limitation the mechanism has and the reason the any-hit stage in
+# `shaders/rt_shadow.rahit` is the answer instead (and why the opacity-micromap extension, which does the same
+# job in hardware, is enabled for a later step).
+# A no-op without `rt_shadows`: no structures, no bake, byte-identical.
+rt_mask_bake = false
+# rt_skin_bake: re-skin the animated casters and REFIT their acceleration structures every frame, so a
+# ray-traced shadow is cast by the mesh where it actually is and not by its bind pose. What it costs: one
+# compute invocation per vertex of every skinned caster (`shaders/compute_skin.slang`, the same skinning
+# maths `shaders/pbr.slang` does, writing OBJECT-space positions and normals into a buffer of the geometry's
+# own), then VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR over the structures of those casters - a refit,
+# not a rebuild, which is why the topology is fixed for a skinned mesh and only the vertex data moves. The
+# structures are built with ALLOW_UPDATE for exactly this (see acceleration_structure::add's refittable
+# argument), and the instance record's vertex address is switched to the skinned buffer for the frame, so the
+# hit shading and the traversal agree about which copy they are looking at.
+# OFF BY DEFAULT, and both reasons are measurements rather than caution. First, it is an A/B instrument: the
+# error it removes was measured BEFORE it existed, by pinning the pose and comparing a traced shadow against
+# the raster one - on the animated sample asset the traced shadow sat 0.538 of mean brightness away from the
+# raster one, in tiles up to 3.78, on exactly the pixels the animation moved. With the pass on, that error is
+# 0.0001 of mean brightness (mean|.| 0.0039, worst tile -0.008): the traced shadow's pose dependence becomes
+# the raster one's to four decimals, i.e. what is left is the ordinary traced-versus-cascade difference.
+# Second, a refit is not free (the pass plus an update of every skinned structure per frame): 0.03 -> 0.07 ms
+# of GPU on the sample asset, which has ONE skinned caster of 576 triangles and 24 joints - so that is a floor,
+# not a budget, and a scene with many or heavy skinned casters is unmeasured. Morph targets are NOT covered:
+# they are the step before skinning, and this pass does not read their deltas.
+# Off by default, so the pass's cost and its effect stay separately measurable.
+rt_skin_bake = false
+
+# fxaa: anti-alias the final image (one extra fullscreen pass over the tonemapped LDR image).
+# Cheap and hardware-independent, but it is a screen-space blur of edges: it softens fine detail and
+# cannot remove sub-pixel shimmer in motion. Its two knobs (sub-pixel strength, edge threshold) live
+# in the debug overlay, not here.
+# unlit: render mode. true draws every surface as its flat base color (factor x albedo texture), with
+# no direct light, shadows, IBL, AO or emissive - a shading-free reference against the lit pass, and
+# useful for assets whose authored data is minimal. It is the "render mode" combo of the debug overlay
+# as a startup setting: the lighting stage is told explicitly (set_unlit) and then writes the stored
+# albedo instead of shading it, because it binds its own pipeline and cannot follow a per-leaf switch.
+unlit = false
+
+# render_scale: the fraction of the window's extent the RENDER CHAIN runs at, so the scene is shaded at
+# fewer pixels than are presented. 1.0 (the default) is the historic frame - every render target is the
+# window's own size, and the frame's last pass writes the swapchain directly. Below 1.0 the whole render
+# chain shrinks together: the G-buffer, the HDR/LDR images, the TAA history, the half-size stochastic
+# targets and the bloom chain all follow ONE extent (core::render_extent is that one definition), which cuts
+# the per-pixel cost of every scene stage, and the frame's last pass resolves those pixels back up to the
+# output extent - so 0.5 shades a quarter of the pixels and still fills the window.
+#
+# The window, the screenshot read-back and the debug overlay stay at the output's size either way, and the
+# presented image is the same size at every scale: what changes is how many pixels the shading was asked
+# for, not how many are shown.
+#
+# It is a STARTUP value: the render targets are created from it, so it takes effect when the swapchain is
+# next built (at startup, or on a window resize), never mid-frame. The supported range is 0.1 .. 1.0; a
+# value outside it is clamped and logged, and 1.0 is EXACT - a config that does not set this key renders
+# the frame it always did.
+render_scale = 1.0
+
+# upscale: WHICH FILTER resolves the render chain onto the output, and it only means anything while
+# `render_scale` is below 1.0 (at 1.0 the chain IS the output and nothing resolves anything).
+#
+#   "easu"   - FSR 1's edge-adaptive spatial upsampling, AMD's EASU (MIT; the port and its license notice are
+#              in shaders/upscale.slang). It estimates an edge direction from a 12-tap neighbourhood,
+#              stretches a lanczos-shaped kernel along it, and clamps the result to the nearest taps so the
+#              negative lobe cannot ring. This is the default: a frame rendered below the output size is
+#              asking for a resolve, and EASU is what that resolve is for.
+#   "linear" - one bilinear tap per output pixel. KEPT rather than replaced because it is the reference the
+#              filter above is MEASURED against: on the character scene at render_scale = 0.5 it differs from
+#              a native-resolution frame by 1.10 of 255 per channel on average but carries 1.40 of the native
+#              frame's 2.86 mean absolute Laplacian (sharpness) - a bilinear resample loses about half the
+#              high-frequency energy of the chain it resamples, and closing that gap without losing the
+#              distance is EASU's whole claim.
+upscale = "easu"
+
+fxaa = false
+
+# gpu_timings: measure how long each pass takes on the GPU (timestamp queries). The frame writes a
+# timestamp at every pass boundary, the values are read back once the frame slot completed and
+# averaged over a 60-frame window: the report goes to the log and to the debug overlay, which is
+# what the renderer's performance work is steered by. Leave it on - the cost is a handful of query
+# writes per frame - and turn it off only for a measurement-free profile run. A device whose queue
+# cannot write timestamps reports "unavailable" and everything else works unchanged.
+gpu_timings = true
+
+# gbuffer_debug / gbuffer_channel: the G-buffer, shown instead of the shaded scene.
+# The opaque pass stores the surface (albedo/metallic, world normal/roughness, material id/AO/flags)
+# into three single-sampled targets and a fullscreen pass displays one channel of it through the
+# ordinary post chain. It is the inspection tool for the G-buffer - a wrong normal encoding or
+# a swapped roughness channel looks like "the lighting is a bit off" once the lighting stage consumed
+# it, so being able to look at the raw data matters. It replaces the lighting stage while it is on,
+# and it skips alpha-blended geometry, so leave it off for normal runs.
+gbuffer_debug = false
+# gbuffer_channel: 0 albedo, 1 world normal, 2 roughness, 3 metallic, 4 ambient occlusion, 5 material id,
+#   6 depth, 7 flags, 8 motion. The last one is TAA's motion vector, amplified (four pixels of motion
+#   saturate) and biased so that "did not move" is flat olive: it answers where reprojection is being
+#   asked to move a sample and which way, which a shaded screenshot cannot show.
+
+# taa: temporal anti-aliasing. The projection is jittered by a Halton(2,3) sequence every frame, the
+# G-buffer carries motion vectors, and a fullscreen resolve blends the current frame with a
+# reprojected, neighborhood-clamped history into the HDR target the post chain reads. It removes what
+# no edge filter can: sub-pixel shimmer in motion. There is no MSAA to fall back on - a G-buffer cannot
+# be multisampled without per-sample shading - so this is the engine's anti-aliasing.
+# The two weights are history (previous frames) weights: `taa_blend_static` for pixels that did not
+# move (0.9 = 10% of the new frame per frame: higher is smoother but slower to react to lighting
+# changes) and `taa_blend_min` once a pixel moves a pixel or more (lower trusts the current frame
+# more, trading smoothing for less ghosting). Both live in the overlay as sliders too.
+taa = false
+taa_blend_static = 0.9
+taa_blend_min = 0.5
+
+# character_forward: the TOON CHARACTER STAGE. It draws the scene's opaque leaves a SECOND time, after the
+# lighting stage, through a pipeline whose depth compare is EQUAL and whose depth write is held off - so it
+# lands on exactly the surface the G-buffer pass recorded and REPLACES the lit pixel rather than layering
+# over it. That is what lets a character carry its own hand-authored shading without being lit twice, which
+# is what happens if a finished (display-space) colour is fed back through the G-buffer.
+#
+# OFF by default, and that default is the feature's contract rather than caution: with it ON every opaque
+# surface in the scene is drawn by the character pipeline, so a frame from a scene with no toon character
+# is bit-for-bit what it was before the stage existed. See vulkan/pass/character_forward.cppm and
+# _toon_ref/PORT_SPEC.md for the architecture this follows.
+#
+# The toon SHADING CHAIN HAS LANDED and this stage now reads the material's four sidecar lanes -
+# `_DiffRampMap`, `_ShadowLutTex`, `_SpecRampMap`, `_MatcapTex` - through the descriptor heap, selected per
+# material FAMILY (see shaders/toon_params.slang). It also gates the screen-space rim (vulkan/pass/toon_screen_rim).
+# The game's own maps for those lanes are not redistributable (ASSET_LICENSE_BOUNDARY_CN.md), so a neutral,
+# redistributable bake stands in for each one; see main.cpp's bake_unit_ramp / bake_shadow_lut / bake_matcap and
+# gltf_loader/toon_material_sidecar.cppm for the `.toon.tsv` the slots come from.
+character_forward = false
+
+# goo_toon: WHICH SHADING MODEL the character stage above draws with. false = the chain written against the
+# author's article (`shaders/character_forward.slang`); true = the REWRITTEN chain whose authority is XIYAG's
+# Goo node presets (`shaders/goo_toon.slang`, registered as the `goo_toon` pipeline - see
+# deren::vulkan::runtime::goo_toon_pipeline_name and build-release-clang64/deren-ab/goo_toon_plan.md).
+#
+# IT IS NOT A SECOND WAY TO TURN THE STAGE ON: with `character_forward` off this selects nothing at all. The two
+# are separate because they answer two questions - whether the stage runs, and which model it runs - and the
+# rewrite is verified by holding the first fixed and moving only the second. The rewrite itself lands ONE
+# reference group at a time; today it carries the iris (`Arknights: Endfield_PBRToon_irisBase`, the two-layer
+# matcap) and every other family is still shaded by the old body, so `goo_toon` on this build moves the iris and
+# nothing else.
+#
+# OFF by default, so a run that does not ask for it gets the frame the old chain produces.
+goo_toon = false
+
+# background_glb: A SECOND MODEL DRAWN AS THE FRAME'S STATIC SURROUND - the ground and the backdrop the
+# subject stands on - imported into the SAME scene tree by the same importer, one line after the subject.
+# Empty (the default) means "this frame has no background model", which is exactly the frame every recorded
+# reference was made from: one import, one leaf set.
+#
+# WHAT THE FLAG DOES, and it is deliberately one flag with two consequences rather than a material trick:
+# the leaves this import creates are marked `primitive::environment`, so (a) the toon CHARACTER stage skips
+# them - the character chain is the cartoon author's chain, written for one character's own material data,
+# and the reference never gave its ground or its dome a toon material - and (b) they are never shadow
+# CASTERS, nor part of the shadow fit, so a 34 m ground disc cannot spend the shadow map's texels on itself.
+# The SCENE pass draws them through the ordinary PBR/unlit path, where a matte ground and a glTF emissive
+# backdrop belong. Everything else about the frame is untouched.
+#
+# A RELATIVE PATH IS RESOLVED AGAINST THE EXECUTABLE'S DIRECTORY (where the other assets are), so a config
+# shipped beside the binary can name one without being absolute.
+#
+# THE OFFSET IS DERIVED, NOT CONFIGURED: the model is expected to have its GROUND at its own y = 0, and it
+# is translated so that plane lands under the subject's feet (the subject's own centering shift plus its own
+# lowest point). A background whose ground is not at y = 0 will sit at the wrong height - the assumption is
+# stated rather than guessed at.
+#
+# Example (the author's own `endfield-background`, a 34 m matte ground disc + emissive dome, converted to
+# glTF): background_glb = "deren-ab/bg/endfield-background/export/background.glb"
+# NOTE ON THAT ASSET: it is licensed for LOCAL REFERENCE ONLY (attribution to 新杨XIYAG is required and it
+# must be replaced before any release - see its SOURCE_TERMS.txt), so it is a development stand-in and not
+# something to ship. The key itself is asset-agnostic.
+background_glb = ""
+
+# validation_layers: Vulkan validation layers + debug messenger (VK_LAYER_KHRONOS_validation).
+# Debug builds default to true, Release builds to false; override per build as needed (e.g.
+# turn it on in a Release build when tracking a problem, or off in Debug for raw speed).
+validation_layers = true
+
+# ---- [gui] debug overlay ----
+[gui]
+show = true   # show the Dear ImGui debug overlay by default (F1 toggles it at runtime)
+# Default debug-panel window size (0 = ImGui auto-size). Nothing persists it any more - the overlay
+# sets io.IniFilename = nullptr, so no imgui_layout.ini is read or written - which means these values
+# apply at the start of EVERY run, and a drag only lasts the session. 560 is tall enough that the
+# render-path controls are visible without scrolling; the panel offers a control when the SESSION can
+# use it (TAA/SSAO/megalights as soon as their pipelines exist, even while their switch is off) and
+# puts the fine-tuning knobs behind the switch they tune, so a group collapses to one row when it is
+# off. It says why in the log when something cannot run at all.
+panel_width  = 420
+panel_height = 560
+
+# ---- [lighting] IBL precompute resolutions ----
+# Lower values speed up startup (fewer pixels precomputed); higher values improve
+# ambient / reflection quality.
+[lighting]
+env_size      = 256   # base environment cubemap size
+env_mip_count = 5     # prefiltered environment mip chain length
+irr_size      = 32    # irradiance cubemap size
+lut_size      = 256   # BRDF LUT size
+
+# demo_lights: spawn this many procedural punctual lights on a helix around the scene bounds (cycling
+# colors, finite range) - the clustered-light stress mode. The debug overlay only edits four light
+# slots, and with four lights the cluster lists and the brute-force loop visit the same handful, so
+# the clustering win is invisible; this is what makes it measurable. They are pushed every frame
+# together with the overlay slots (which take priority if the two together would overflow the light
+# array). 0 = overlay lights only.
+demo_lights = 0
+
+# environment_hdr: an EQUIRECTANGULAR (lat-long) floating-point sky, used as the image-based lighting
+# instead of the procedural gradient. Empty - the default - keeps the procedural sky, and a frame with
+# this unset is byte-identical to one from before the key existed: that is the contract, and every
+# other value here is only reachable through this key.
+#
+# It exists because the author's own preview renders were lit by a captured studio, not by a gradient:
+# their package's manifest names `lighting/studio_01_1k.exr` with `world_strength 0.35`, and that
+# light is what fills the shadows their area light casts (ours come out of the toon rig and the
+# environment, so the character's ambient is otherwise a blue-grey sky band). Converting that EXR to a
+# Radiance .hdr is a one-liner in Blender - see build-release-clang64/deren-ab/bg/_hdr_convert.py, which
+# writes studio_01_1k.hdr next to the EXR - because the runtime reads .hdr and NOT .exr: stb_image
+# decodes Radiance but has no OpenEXR support, and the runtime has no other image decoder.
+#
+# What the key does, EXACTLY: it replaces the cubemap that the whole IBL precompute (irradiance,
+# prefiltered specular, BRDF LUT input) is built from. The procedural gradient disappears from the
+# IBL, INCLUDING the sun disc the gradient used to bake in, so a shadowed surface loses its sky band
+# and gains the room instead. It does NOT touch the direct light: `sun_direction` above still drives
+# the shadow map, the toon terminator and the visible sun disc, because the direct term is a light,
+# not part of the environment. The VISIBLE sky (the analytic gradient the sky shader draws behind
+# everything) is also untouched, since it is a per-pixel function rather than a cubemap fetch - with
+# a background dome in front of it, as `[render] background_glb` gives, it is hidden anyway.
+#
+# A relative path resolves against the executable's directory, exactly like `[render] background_glb`.
+# A missing or undecodable file is a hard startup error, not a fallback: finding out from a log line
+# that a frame was lit differently than intended is worse than not starting.
+environment_hdr = ""
+
+# environment_intensity: a plain multiplier on every texel of `environment_hdr`, and its default is
+# the reference package's own `world_strength` - so pointing the key at the converted studio HDR
+# reproduces the author's lighting level with nothing else to set. 1.0 = the file's raw radiance.
+# It has no effect while `environment_hdr` is empty (the procedural sky is not scaled by it).
+environment_intensity = 0.35
+
+# area_light_*: the reference package's RECTANGULAR SOFT BOX, which its manifest
+# (build-release-clang64/deren-ab/bg/endfield-background/manifest.json) names as the main light of the shot:
+#
+#     UsdLuxRectLight, size_m 30, power_w 4000, position_blender_m [-3, -4, 15], aim_at [0, 0, 0]
+#
+# Blender is Z-up and this engine is Y-up, so that position reads [-3, 15, 4] here: 15.8 m away and ~72
+# degrees up. A 30 m source that close to overhead is why the author's own preview is bright inside the
+# shadows a point light would leave black, and reproducing it is the point of these keys.
+#
+# THIS IS THE ENGINE'S MAIN LIGHT, NOT AN EXTRA ONE. The engine shades with exactly one directional light,
+# so the emitter is expressed THROUGH it: `area_light_position` (centre) becomes that light's DIRECTION and,
+# while `area_light_irradiance` is true, the emitter's radiance multiplies `[render] sun_intensity`.
+# `area_light_size` together with `area_light_irradiance` is therefore also the switch that decides whether
+# `[lighting] sun_direction` or the emitter sets the direction - while the emitter contributes energy it
+# wins, and the visible sun disc and the shadow cascades follow it. (In the dressed scene the analytic sky's
+# own sun then sits behind the `[render] background_glb` dome and is not visible; that is a consequence of
+# the emitter being the main light, not a second light being added.)
+#
+# POSITION AND TARGET ARE RELATIVE TO THE AUTHOR'S ORIGIN - the character's feet on the ground, world XZ = 0 -
+# and NOT to the scene's bounding-box centre. The manifest's numbers assume the character stands at the
+# origin, and in Blender that origin is on the ground under it. This engine sinks the imported model by its
+# radius, which lands the feet at `bounds.min.y + (-scene_center.y - scene_radius)`; for this character that
+# is (0, -2.198, 0) - the same point the background package's own import offset lands on. `world = author
+# origin + position` is what lets the manifest's numbers be copied verbatim: [-3, 15, 4] here becomes
+# (-3, 12.802, 4) in world space. The derivation is anchored there and main.cpp logs the origin it used, so a
+# frame can be audited against the number.
+#
+# ANCHORING ON THE BOUNDING-BOX CENTRE INSTEAD IS WRONG (an earlier version of this block did): the centre
+# sits half a body above the feet, ~0.85 m for this character, which tilts the visible emitter by ~6 degrees
+# of elevation and ~16 degrees of azimuth and moves its distance from 15.811388 m to 17.37 m. The DIRECTION
+# the sun comes from is the same either way - only the emitter's world position moves.
+#
+# SIZE 0 (THE DEFAULT) IS THE CONTRACT: no area light, both shading lanes written as zero, and a frame is
+# byte-identical to one rendered before these keys existed.
+#
+# WHAT THIS IS *NOT* (v1.1's honest boundary): the emitter does not get a shading pass of its own. It is
+# expressed through the engine's one directional light - the host points the sun's direction at it and scales
+# the sun's intensity by its radiance - and the shadow gets a world-space penumbra from
+# shaders/shading.glsl. An earlier version additionally corrected the direct term for the emitter's SIZE
+# (a polygon-Lambert term read out of the second light lane); measurement showed it drew the main light to
+# zero, and it has been deleted. It is not a full linearly-transformed-cosine area-light solver and the
+# penumbra is not PCSS: the soft edge is bounded by the shadow map's own resolution, and the emitter's own
+# shading (its falloff across the receiver) is not integrated. Treat it as "the soft box the reference
+# used", not as a physically complete area-light renderer.
+#
+area_light_size      = 0.0   # side of the square emitter in metres (0 = no area light; the whole block is inert)
+area_light_power     = 0.0   # total power in watts (the manifest's Blender unit)
+area_light_position  = [0.0, 0.0, 0.0]   # emitter centre, RELATIVE TO THE AUTHOR ORIGIN (the feet), Y-up metres
+area_light_target    = [0.0, 0.0, 0.0]   # aim point, same frame as `area_light_position`: sets the emitting side
+area_light_intensity = 1.0   # multiplier on the emitter's radiance; radiance = intensity * power / (pi * size^2)
+                             # 4000 W over a 30 m side reads 1.41471 - the reference package's own soft key.
+                             # IT CANNOT EXCEED 3.0: this value multiplies `[render] sun_intensity`, which the
+                             # runtime clamps to 0..3, so anything above ~2.12 on this key is clipped there.
+                             # (It reaches the sun only while `area_light_irradiance` is true.)
+area_light_irradiance = true # true = the emitter TAKES OVER the main light: its direction becomes
+                             # `[lighting] sun_direction` and its radiance multiplies `[render] sun_intensity`
+                             # (an A/B knob for "the soft box is the key light" vs. "the sun is")
+                             # false = the emitter contributes ONLY its penumbra; the sun keeps its own
+                             # direction and intensity and the block only softens the shadow
+area_light_shadow     = true # give the shadow a penumbra: while false the area light does not touch the shadow
+                             # term at all, so the shadow keeps the hard edge it has without this block
+area_light_softness   = 0.0  # the penumbra's world radius in metres; 0 = automatic, and the automatic value
+                             # is `0.05 * size / |position - target|` (0.094868 m for the reference soft box:
+                             # 0.05 * 30 / 15.811388) - a rough heuristic that grows with the source and
+                             # shrinks with the distance from the emitter to what it is aimed at
+
+# ---- [toon] the toon character stage's LIGHT RIG ----
+#
+# These are the 终末地 chain's GLOBAL numbers (see deren::vulkan::toon_rig): the ones tuned once for a whole character
+# rather than per material. A material FAMILY's numbers live in shaders/toon_params.slang - they are a contract
+# between two shader stages - and a MATERIAL's come from the `.toon.tsv` sidecar beside the model. The defaults
+# below are the article's own values, so saying nothing here renders what this port was measured at.
+[toon]
+# day_strength: the article's `_DayStrength`, and the one knob that moves a frame most. 1 = the sun carries the
+#   character with the head light supplementing it; 0 = the sun's DIRECT term is removed ENTIRELY (no terminator,
+#   no light direction) and the head light plus the environment carry it, which is what the game shows for a
+#   character standing in a corner. Values between the two BLEND two whole shading outcomes rather than dimming
+#   one, because a dimmed sun still draws its own terminator across the character.
+day_strength = 1.0
+# head_light_day0 / head_light_day1: the weight of the light the game rigs straight over every character, in each
+#   of the two states above. It is a fill rather than a lamp: a large weight at day 1 would light the character
+#   from above in full sun. 0.7 / 0.3 are `_OtherLightResultStrength_day0/_day1`'s own defaults, which all six of
+#   the author's shaders declare identically; day1 is LIVE at the default day_strength = 1 (the day blend is
+#   `lerp(head_day0, sun + head_day1, day_strength)`), day0 only at day_strength < 1.
+head_light_day0 = 0.7
+head_light_day1 = 0.3
+# head_light_colour: rgb, the head light's colour on the SHADOW side of a surface (it lerps toward white as the
+#   surface turns into the light).
+head_light_colour = [0.60, 0.65, 0.80]
+# sun_dark_colour: rgb, the SUN's colour on a surface's shadow side - a grey derived from it tints the shadow
+#   side, so the dark side is not simply the lit side multiplied down.
+sun_dark_colour = [0.60, 0.65, 0.80]
+# env_strength / env_rotation: the environment's specular half - how much of it the character takes, and how far
+#   the reflected sky is turned about Y (DEGREES) so an artist can move the sky without moving the sun.
+env_strength = 1.0
+env_rotation = 0.0
+# specular_strength / diffuse_blend_effect: the global scales on the stylized highlight and on the step-aside the
+#   diffuse makes for it (the step's per-material weight is the albedo texture's alpha).
+specular_strength = 1.0
+diffuse_blend_effect = 1.0
+# rim_area / rim_strength / rim_nolxz_strength: the contour. `rim_area` moves the fresnel band's INNER edge
+#   without moving its outer one (1.0 is the article's `_RimLightArea` default - the band runs 0.2..0.5, against
+#   0.5..0.7 at the 0.5 this port used to carry); the other two scale the two mechanisms - the
+#   view-angle band and the one taken from the light's own azimuth.
+rim_area = 1.0
+rim_strength = 1.0
+rim_nolxz_strength = 1.0
+# backlight_strength: how far the backlight compensation may move a surface along the ramp's light axis. It is
+#   what keeps a backlit character's silhouette from collapsing into one flat shape.
+backlight_strength = 1.0
+# emotion_type: WHICH EXPRESSION THE FACE IS WEARING - the cell of `_EmotionMap`'s 2x2 atlas of eyebrow/mouth
+#   paintings. 0 = none (the face keeps its own albedo, and every capture before this key existed was taken at
+#   0); 1..3 select the other three cells. It is a config key rather than a material value because the material
+#   files have none: the game picks the expression from the character's animation/script system, and nothing in
+#   the `.toon.tsv` describes it. See `deren::vulkan::toon_rig`'s `other_colour.w` for the lane it rides.
+emotion_type = 0.0

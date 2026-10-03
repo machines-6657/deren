@@ -1,0 +1,155 @@
+#version 460 // required: GL_EXT_ray_tracing is written against GLSL 4.60, like the ray-query form it replaces
+#extension GL_EXT_ray_tracing : require
+
+/**
+ * @file shaders/rt_shadow.rgen
+ * @brief Ray-traced sun visibility: one traceRayEXT per pixel against the scene's top level structure.
+ * @ingroup shaders
+ *
+ * This is `rt_shadow.comp`'s estimator moved onto a ray-tracing PIPELINE, and the estimator itself is
+ * unchanged: a pixel that has geometry reconstructs its world position from the G-buffer depth, casts one ray
+ * towards the sun, and writes 1.0 (lit) or 0.0 (occluded). Nothing is shaded here and no hit information is
+ * used - `gl_RayFlagsTerminateOnFirstHitEXT` means the traversal stops at the first triangle, and the hit
+ * group's only job is to say "something was there" through the payload.
+ *
+ * WHY A PIPELINE RATHER THAN A RAY QUERY: an inline ray query has no any-hit stage, so an alpha-tested
+ * (alphaMode MASK) surface is SOLID to the ray - the limitation `rt_mask_bake`'s triangle-collapse rule tried
+ * to paper over and measured as worse than doing nothing. A traced ray can run an any-hit shader, and it can
+ * consult an OPACITY MICROMAP, which is the hardware answer to the same question (per-microtriangle opacity,
+ * with the any-hit shader as the fallback for the states the micromap calls unknown). This file is the first
+ * of those three steps: the estimator on the new path, with no alpha test yet, so its output lands on the
+ * raster reference the way the ray-query form does (whole-frame mean|d| = 0.0287, all of it at the shadow
+ * edge; the payload trap that stood between the two is documented at the payload declaration and in the pass
+ * header, because it cost more to find than the whole rest of this step did).
+ *
+ * What the ray buys over a cascaded shadow map is not sharpness but CORRECTNESS of the occluder set: a caster
+ * outside every cascade's fitted box, a caster between two cascades, a contact shadow at the base of an
+ * object, and the bias a depth map needs to avoid self-shadowing all stop being approximations.
+ *
+ * Output is a HARD visibility factor. The raster path's `sampler2DArrayShadow` with LINEAR filtering gives
+ * hardware PCF over a 2x2 footprint, so the two are not meant to match pixel for pixel at a penumbra.
+ *
+ * The self-intersection bias is a normal offset scaled by the pixel's distance from the camera, plus a floor:
+ * an absolute epsilon is too small for a distant surface and too large for a near one, and the shadow map's
+ * texel-sized world offset has no meaning here (there is no texel).
+ */
+
+// set 0 = the shared scene set, HEAP-NATIVE now (see docs/descriptor_heap_migration.md): the camera and light
+// blocks are per FRAME SLOT, the top level structure too (it is rebuilt every frame), and the visibility image the
+// lighting stage samples is a STORAGE image here - one image, two descriptors, so it uses the storage slot the grid
+// reserves (heap_slots_rt_visibility_storage) and not the sampled one. The LightUBO block is declared SHORTER than
+// the CPU's struct on purpose - only light_dir is read, and a uniform block may declare a prefix of the buffer as
+// long as the members it does declare sit at the same offsets (std140), which they do.
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#include "heap_slots.glsl"
+// A `buffer`, not a `uniform`: the heap descriptor is a STORAGE descriptor and the storage class a shader
+// reads it through has to match it (see shading.glsl's note). The three members it does declare sit at the
+// same offsets under std430 as under std140 (0, 64, 128).
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) buffer CameraUBO {
+    mat4 view;
+    mat4 proj;
+    vec4 camera_pos;
+} camera[];
+// A `buffer`, not a `uniform`: see the camera block's note above. It is declared SHORTER than the CPU's
+// struct on purpose - only light_dir is read - and std430 places the members it does declare at the
+// offsets std140 did.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) buffer LightUBO {
+    mat4 light_view_proj[4]; // MAX_SHADOW_CASCADES: not read here, only here to keep light_dir's offset
+    vec4 light_dir;          // xyz = surface-to-light direction (see shading.glsl)
+} light[];
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform accelerationStructureEXT heap_tlas[];
+
+// set 1 = the G-buffer set: the surface the ray starts from. Read at texel centres, like every other consumer of
+// the stored surface, so the NEAREST sampler; both images are per SWAPCHAIN IMAGE.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D gbuffer_normal_texture[]; // RGBA16F: world normal.xyz
+layout(descriptor_heap, descriptor_stride = heap_slot_stride) uniform texture2D gbuffer_depth_texture[];  // the pass's own 1x depth
+
+// set 0 as well: the visibility image the deferred lighting stage samples. It is written through the scene set
+// because that set is per FRAME SLOT, which is what the image is - see runtime.
+layout(descriptor_heap, descriptor_stride = heap_slot_stride, r16f) uniform image2D visibility_image[];
+
+layout(push_constant) uniform RtShadowPush {
+    mat4 inv_view_proj; // clip -> world, the same block the lighting stage reconstructs from
+    vec4 params;        // x = ray tmin, y = absolute normal-offset floor, z = relative offset scale, w = unused
+    // THE HEAP INDICES (see heap_slots.glsl), at the END so every field above keeps its offset.
+    uint frame_slot;
+    uint image_index;
+} pc;
+#define heap_frame_slot (pc.frame_slot)
+#define heap_image_index (pc.image_index)
+
+/// 1.0 = the ray hit something (the hit group writes it), 0.0 = nothing did (the miss shader writes it). It is
+/// NOT initialised here, and that is a measured requirement rather than a style choice: the payload must be
+/// written by the stage that ends the ray, on EVERY path. A raygen that stores the same 0.0 the miss shader
+/// stores makes the miss shader's store look redundant, and this device's compiler then drops it and reads the
+/// payload back uninitialised - which is the shadow bug the pass header records (61.22 against a 76.48
+/// reference). One store per path, no pre-initialisation, and the traversal agrees with the inline ray query
+/// and the raster reference. The full four-arm measurement is in the pass header.
+layout(location = 0) rayPayloadEXT float payload_occluded;
+
+/**
+ * @brief world position of a depth-buffer sample (the lighting stage's reconstruction)
+ * @param uv the sample position
+ * @param depth the stored depth in [0,1]
+ * @return the world-space position
+ */
+vec3 world_position_from_depth(vec2 uv, float depth) {
+    const vec4 clip = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    const vec4 world = pc.inv_view_proj * clip;
+    return world.xyz / world.w;
+}
+
+void main() {
+    const ivec2 extent = imageSize(visibility_image[heap_slots_rt_visibility_storage + heap_frame_slot]);
+    const ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    if (pixel.x >= extent.x || pixel.y >= extent.y) {
+        return; // the launch dims are the extent, but a shader that assumes that is one rounding away from writing out of bounds
+    }
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+
+    const float depth = heap_texel(gbuffer_depth_texture[heap_slots_gbuffer_depth + heap_image_index], heap_sampler_gbuffer, uv).r;
+    if (depth >= 1.0) {
+        // No geometry: nothing to shade, so nothing to shadow. 1.0 rather than 0.0 because the lighting stage
+        // uses this as a multiplier on a sun term that does not exist here anyway, and "lit" is the value that
+        // leaves a debug read-back readable.
+        imageStore(visibility_image[heap_slots_rt_visibility_storage + heap_frame_slot], pixel, vec4(1.0));
+        return;
+    }
+
+    const vec3 normal = normalize(heap_texel(gbuffer_normal_texture[heap_slots_gbuffer_normal + heap_image_index], heap_sampler_gbuffer, uv).xyz);
+    const vec3 world_pos = world_position_from_depth(uv, depth);
+    const vec3 to_light = normalize(light[heap_light_slot].light_dir.xyz);
+
+    // The bias: offset along the normal by an amount that grows with the distance from the camera (a surface 30
+    // units away has coarser depth precision than one at 2), with an absolute floor so a pixel right at the near
+    // plane still clears its own triangle. The ray also starts at tmin, which handles the case where the offset
+    // direction itself is grazing.
+    const float distance = length(world_pos - camera[heap_camera_slot].camera_pos.xyz);
+    const vec3 origin = world_pos + normal * max(pc.params.y, pc.params.z * distance);
+
+    // The payload is written by the hit group (1.0) and by the miss shader (0.0) - exactly one store per path -
+    // and deliberately NOT initialised here: see the note above the payload declaration.
+    //
+    // NO `gl_RayFlagsOpaqueEXT`: it declares "no any-hit shader may be invoked for this ray", which is the
+    // opposite of what this ray is for. Measured, the flag does NOT actually suppress the hit group's any-hit
+    // stage on this device (see shaders/rt_shadow.rahit for the three-arm test); it is left off so that the
+    // alpha test does not rest on a driver over-invoking a stage a conforming one would skip.
+    traceRayEXT(heap_tlas[heap_slots_tlas + heap_frame_slot],
+                gl_RayFlagsTerminateOnFirstHitEXT,
+                0xFF, // every instance can occlude
+                0,    // sbtRecordOffset: one hit group, so every instance maps to it
+                0,    // sbtRecordStride
+                0,    // missIndex
+                origin,
+                pc.params.x,
+                to_light,
+                1e30, // a directional light: the ray is a half-line, not a segment
+                0     // payload location
+    );
+
+    imageStore(visibility_image[heap_slots_rt_visibility_storage + heap_frame_slot], pixel, vec4(payload_occluded > 0.5 ? 0.0 : 1.0));
+}
+
+
+

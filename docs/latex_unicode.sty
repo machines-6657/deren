@@ -1,0 +1,52 @@
+%% LaTeX support file for the doxygen-generated manual.
+%%
+%% Why this file exists
+%% --------------------
+%% The manual is typeset with pdflatex (see Doxyfile and scripts/windows/build_docs.ps1).
+%% The doxygen input is not ASCII-only: several doxygen comments quote the reference
+%% toon graph by its own node labels (for example "mixed" / "group" node names written in
+%% Chinese) and the gltf loader quotes model part names.  A pdflatex run stops with
+%%   ! LaTeX Error: Unicode character ... not set up for use with LaTeX.
+%% as soon as it meets such a character in text mode.
+%%
+%% Text files under docs/ are forced to be ASCII by tests/test_docs.cpp, but that check only
+%% covers markdown pages; source comments that reach the manual are free of it, so the
+%% generated .tex can carry any UTF-8 character the sources contain.
+%%
+%% What this file does
+%% -------------------
+%% * Loads CJKutf8 (part of MiKTeX's cjk package, already used by this project's toolchain)
+%%   and switches it on for the whole document, so CJK characters are typeset by a real font
+%%   instead of being handed to inputenc, which has no table entry for them.
+%% * Declares the few non-CJK symbols that inputenc does not know either.  The right-hand
+%%   side is deliberately ASCII or math-mode TeX, so the declarations themselves stay
+%%   portable and this file remains ASCII-only.
+%%
+%% Adding a character: if a future pdflatex run stops on an unmapped one, add a
+%% \DeclareUnicodeCharacter line here rather than deleting the character from the comment
+%% that produced it - those characters are traceability data, not decoration.
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{latex_unicode}[2026/10/02 unicode support for the generated manual]
+
+\RequirePackage{CJKutf8}
+
+% The CJK environment has to cover the whole body, but it must not be opened from
+% \AtBeginDocument: doxygen's preamble loads more packages from its own \AtBeginDocument
+% hooks (natbib/backref do), and opening a group first makes LaTeX abort with
+%   ! LaTeX Error: Loading a class or package in a group.
+% The kernel hook begindocument/end runs after those hooks, and enddocument runs before
+% the final page is shipped out.
+\AddToHook{begindocument/end}{\begin{CJK*}{UTF8}{gbsn}}
+\AddToHook{enddocument}{\end{CJK*}}
+
+% Symbols outside the CJK ranges that utf8.def has no entry for.
+\DeclareUnicodeCharacter{2299}{\ensuremath{\odot}}          % hadamard / elementwise product
+\DeclareUnicodeCharacter{2208}{\ensuremath{\in}}            % element of
+\DeclareUnicodeCharacter{2212}{\ensuremath{-}}              % minus sign
+\DeclareUnicodeCharacter{2460}{\textcircled{\scriptsize 1}} % circled digit one
+\DeclareUnicodeCharacter{26A0}{\textbf{!}}                  % warning sign
+\DeclareUnicodeCharacter{207B}{\ensuremath{^{-}}}           % superscript minus
+\DeclareUnicodeCharacter{FF08}{(}                            % fullwidth left parenthesis
+\DeclareUnicodeCharacter{FF09}{)}                            % fullwidth right parenthesis
+\DeclareUnicodeCharacter{FF0C}{,}                            % fullwidth comma
+\endinput
