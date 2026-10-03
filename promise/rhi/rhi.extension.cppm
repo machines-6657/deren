@@ -16,15 +16,14 @@
 //
 //   1. `abilities()` returns a BITMASK and one `extension_kind` value is one bit,
 //      so the engine learns everything without a virtual call per ability, and the
-//      §8 consistency gate can iterate the bits: for every set bit, the matching
-//      `deren_ext_<ability>_v1` symbol must resolve with a matching abi.
+//      consistency gate can iterate the bits: for every set bit, query_extension()
+//      must return the matching usable object. No additional C export is required.
 //
 //      A BIT IS ANNOUNCED ONLY IF THE ABILITY OBJECT EXISTS **AND** CAN SERVE THE OBJECTS THIS
 //      BACKEND PRODUCES: `query_extension(kind)` must answer, and every operation the ability
 //      declares must be performable on something the backend can hand out. A device-level fact
 //      ("this device is 1.2, so bufferDeviceAddress exists") is not an ability until there is a
-//      `buffer` to ask about - the strict form of "置位 ⇒ 取得到 且 用得上". The §8 symbol-resolution
-//      gate stays as written; this sentence is the rule that gate assumes.
+//      `buffer` to ask about - the strict form of "置位 ⇒ 取得到 且 用得上".
 //   2. Every ability derives from `extension`, whose only virtual is `kind()`.
 //      Adding a sixth ability therefore cannot disturb the vtable of the other
 //      five, and `query_extension()` stays a one-line lookup in the backend.
@@ -32,11 +31,8 @@
 //      `std::string`, no exception across the boundary (§4.2). The engine and the
 //      backend each compile this partition; neither exports a module symbol for it.
 //
-// Deliberately NOT here yet: the C function tables that §3.5 pairs with each
-// ability (`deren_ext_<ability>_v1` returning a POD struct of function pointers).
-// That is the S2 half of the same decision. The classes below are the
-// compile-time face of the same five abilities, and they are what the probe
-// backend implements today (tests/probe_backend.cpp).
+// 能力入口只有 query_extension；这些虚接口沿用同工具链的 C++ ABI。
+// 不再增加一套 deren_ext_* C 函数表；该边界不承诺供非 C++ 宿主使用。
 // ============================================================================
 module;
 
@@ -59,10 +55,8 @@ import :contract;
  * (§1.5). What DX12 also has stays in `deren::promise::rhi::api_core`; the rest is declared here, one
  * class per ability, and announced as one bit in `api_core::abilities()`.
  *
- * The five abilities below are the compile-time face of plan §3.5's model. The run-time face - a
- * `deren_ext_<ability>_v1` C function table per ability, resolved and ABI-checked at load time - is
- * the S2 half of the same decision, and the §8 consistency gate walks `abilities()`'s set bits to
- * check exactly that pairing.
+ * The ability objects are obtained through query_extension() after the core ABI handshake;
+ * the consistency gate checks reported bits against those objects, without extra C exports.
  */
 
 export namespace deren::promise::rhi {
@@ -84,8 +78,8 @@ export namespace deren::promise::rhi {
 
     /// One bit per ability a backend can report through `api_core::abilities()`.
     ///
-    /// The bit values are the contract (§3.5): the consistency gate resolves
-    /// `deren_ext_<ability>_v1` per set bit, so a value must never move and a new
+    /// The bit values are the contract: the consistency gate queries an object
+    /// per set bit, so a value must never move and a new
     /// ability takes the next free bit. Zero means "no abilities" and is spelled
     /// `no_abilities`.
     enum class extension_kind : std::uint32_t {

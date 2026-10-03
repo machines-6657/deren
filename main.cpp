@@ -2,6 +2,8 @@
 #include <fstream>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
 // ---- THE GOO REFERENCE'S PRE-INTEGRATED FGD LUT IS A PNG, AND THIS IS THE DECODER ----
 //
 // `third_party/stb/stb_image.h` is already vendored and already used by `gltf_loader.cpp` for GLB textures, and
@@ -23,6 +25,7 @@ import deren.chores; // demo bootstrap helpers (shader loading / dir locating / 
 import deren.gltf_loader;
 import deren.toon_material_sidecar; // the .toon.tsv a character model carries: its toon maps, and the _Use flags
 import deren.utility;               // re-exports deren.utility:frame_clock / frame_stats / bvh / better_pmr / thread_pool / data_block
+import deren.promise.rhi;
 import deren.vulkan.animation;
 import deren.vulkan.animation.mmd_motion; // VMD (MMD motion) parsing, retargeting and clip baking      // animation::controller: glTF playback / skinning / morphs on the runtime tree
 import deren.vulkan.math;
@@ -37,6 +40,39 @@ import deren.vulkan.render_start_demo; // the example's pass wiring: this app's 
 [[maybe_unused]] static auto& pmr = deren::utility::init_pmr(); // NOLINT(keep-alive)
 
 namespace {
+
+    // 窗口先于 runtime 创建、晚于 runtime 销毁，后端只借用它。
+    class application_window {
+    public:
+        explicit application_window(deren::promise::rhi::create_info const& options) {
+            if (glfwInit() != GLFW_TRUE) {
+                deren::utility::panic("application: GLFW initialization failed");
+            }
+            glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+            glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+            glfwWindowHint(GLFW_VISIBLE, options.window_visible ? GLFW_TRUE : GLFW_FALSE);
+            this->window = glfwCreateWindow(options.window_width, options.window_height, options.window_title, nullptr, nullptr);
+            if (this->window == nullptr) {
+                glfwTerminate();
+                deren::utility::panic("application: window creation failed");
+            }
+        }
+
+        ~application_window() noexcept {
+            glfwDestroyWindow(this->window);
+            glfwTerminate();
+        }
+
+        application_window(application_window const&) = delete;
+        application_window& operator=(application_window const&) = delete;
+
+        [[nodiscard]] GLFWwindow* get() const noexcept {
+            return this->window;
+        }
+
+    private:
+        GLFWwindow* window = nullptr;
+    };
 
     // ---- THE ASSET'S OWN `extras` ROWS, WHICH THE LOADER CARRIES AND THE TOON LOOKUP CONSULTS FIRST ----
     //
@@ -436,10 +472,10 @@ int main(int argc, char** argv) {
 
     // 5. Construct deren::vulkan::runtime from the startup render settings (window size / title /
     //    vsync; the defaults in render_settings mirror the historic hardcoded values)
-    deren::vulkan::core_create_info core_options = {};
+    deren::promise::rhi::create_info core_options = {};
     core_options.window_width = settings.render.window_width;
     core_options.window_height = settings.render.window_height;
-    core_options.window_title = settings.render.window_title;
+    core_options.window_title = settings.render.window_title.c_str();
     core_options.vsync = settings.render.vsync;
     core_options.validation_layers = settings.render.validation_layers;
     // the render scale is a CREATION option and not a runtime setter, because it decides the extent every
@@ -455,6 +491,8 @@ int main(int argc, char** argv) {
     //      recorded A/B anchors are byte-identical with this line and without it, which is the measurement
     //      behind the claim. The interactive path (`capture.frames == 0`) is untouched: a normal window.
     core_options.window_visible = capture.frames == 0;
+    application_window window{core_options};
+    core_options.native_window = window.get();
     deren::vulkan::runtime runtime{core_options};
     runtime.background_color = glm::vec3(settings.render.clear_color[0], settings.render.clear_color[1], settings.render.clear_color[2]);
     // shadow is applied after enable_shadows() below (it needs the shadow maps to exist)
