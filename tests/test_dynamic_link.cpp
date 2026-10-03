@@ -269,6 +269,18 @@ namespace {
     }
 
     void test_loading_the_probe_dll_and_using_its_symbols(fs::path const& directory) {
+        // 字符串视图里的 NUL 不能让系统悄悄只加载前半段路径。
+        std::string nul_path = (directory / std::string{probe_file_name}).string();
+        nul_path.push_back('\0');
+        nul_path += "ignored.dll";
+        auto const embedded_nul = deren::utility::dynamic_link::load(nul_path);
+        CHECK(!embedded_nul.has_value());
+        auto const empty = deren::utility::dynamic_link::load("");
+        CHECK(!empty.has_value());
+        if (!empty.has_value()) {
+            CHECK(empty.error().message.find("empty") != std::string::npos);
+        }
+
         auto loaded = deren::utility::dynamic_link::load((directory / std::string{probe_file_name}).string());
         CHECK(loaded.has_value());
         if (!loaded.has_value()) {

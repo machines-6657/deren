@@ -324,10 +324,11 @@ namespace deren::utility::dynamic_link {
     }
 
     std::expected<library, load_error> load(std::string_view file_name) noexcept {
-        std::string const path = complete_file_name(file_name);
-        if (path.empty()) {
-            return std::unexpected(load_error{0, "the file name is empty"});
+        // 先校验原始视图，不能让补后缀掩盖空输入，或让系统在 NUL 处截断路径。
+        if (file_name.empty() || file_name.contains('\0')) {
+            return std::unexpected(load_error{0, "the file name is empty or contains a NUL byte"});
         }
+        std::string const path = complete_file_name(file_name);
 #ifdef _WIN32
         std::vector<wchar_t> wide;
         if (!to_wide(path, wide)) {
