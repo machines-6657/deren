@@ -834,6 +834,20 @@ option(VR_BUILD_TESTS "Build the headless unit tests" ON)
 
 if(VR_BUILD_TESTS)
     enable_testing()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME test_backend_boundary
+        COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+                -s "${CMAKE_CURRENT_SOURCE_DIR}/tests" -p test_backend_boundary.py -v)
+    set_tests_properties(test_backend_boundary PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-run"
+        ENVIRONMENT "TMP=${CMAKE_CURRENT_BINARY_DIR}/test-run;TEMP=${CMAKE_CURRENT_BINARY_DIR}/test-run")
+    # 完整产品先构建，再量 main/chores/引擎归档，避免半构建产生假性下降。
+    add_custom_target(check-backend-boundary
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_backend_boundary.py"
+                --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+                --report "${CMAKE_CURRENT_BINARY_DIR}/backend_boundary_report.json"
+        DEPENDS deren
+        VERBATIM)
 
     set(VR_TEST_TARGETS test_app_config test_utility test_math test_animation test_gltf_loader test_toon_material_sidecar test_shadow_fit test_render_resources test_pass test_shader_sources test_meshlet test_goo_toon_math test_docs test_dynamic_link)
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-run")

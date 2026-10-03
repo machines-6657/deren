@@ -7,7 +7,7 @@ WHAT THIS IS
     spellings in the source - is what has to reach zero before the flip. This script
     measures exactly that set:
 
-        symbols DEFINED in deren_vulkan  INTERSECT  symbols UNDEFINED in vulkancorekit
+        symbols DEFINED in deren_vulkan  INTERSECT  symbols UNDEFINED in engine/application consumers
 
     and it measures it from the ARCHIVES, not from the source and not from the object
     directories. The object directories are not trustworthy here: `build-release-clang64/
@@ -16,9 +16,11 @@ WHAT THIS IS
 
 WHY A RATCHET
     The same discipline as the 13 frozen render hashes: a checked-in baseline, and the
-    gate fails when the number GROWS. While the migration is in flight the count falls;
+    gate fails when a NEW SYMBOL appears, even if another dependency disappeared.
+    While the migration is in flight the count falls;
     lower the baseline with `--update` each time, and the boundary can never quietly
-    re-acquire a dependency. At the flip the baseline is 0 and the script is the proof.
+    re-acquire a dependency. At the flip use --require-zero; DLL import/export and
+    product behavior gates remain separate requirements.
 
 THE SECOND NUMBER: OWNING STL ACROSS THE BOUNDARY
     A symbol whose signature carries `std::vector` / `std::string` / an allocator is an
@@ -28,7 +30,7 @@ THE SECOND NUMBER: OWNING STL ACROSS THE BOUNDARY
     as a ratchet of its own - it is the one part of the migration where "it links" is not
     the same as "it is safe".
 
-MEASURED 2026-10-03, build-release-clang64 (Release clang64):
+HISTORICAL MEASUREMENT, build-release-clang64 (Release clang64):
     78 symbols / 227 reference sites / 31 archive members; 0 in the reverse direction;
     1 of the 78 carries owning STL.
 
@@ -36,13 +38,14 @@ BASELINES ARE PER TOOLCHAIN (the symbol sets are not comparable across them):
     backend_boundary_baseline.mingw.json   <- the measured one, from the clang64 tree
     backend_boundary_baseline.msvc.json    <- record before gating the MSVC tree
     backend_boundary_baseline.posix.json   <- same for a Linux tree
-    A tree with no baseline records nothing and never fails; `--update` writes one.
+    A tree with no baseline fails; `--initialize` explicitly records the first one.
+    `--update` can only reduce an existing set. Neither mutation obeys `--warn`.
 
 USAGE
     python scripts/check_backend_boundary.py                       # gate against the baseline
     python scripts/check_backend_boundary.py --update              # ratchet down to today
     python scripts/check_backend_boundary.py --list                # the worklist, demangled
-    python scripts/check_backend_boundary.py --warn                # report, never fail (CI's first phase)
+    python scripts/check_backend_boundary.py --warn                # ordinary checks report failures; mutations/flip stay strict
     python scripts/check_backend_boundary.py --build-dir DIR
 """
 from __future__ import annotations
@@ -54,6 +57,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 
 BACKEND_TARGET = "deren_vulkan"
@@ -115,6 +119,16 @@ def find_tool(candidates) -> str | None:
         if path:
             return path
     return None
+
+
+def same_artifact(left: str, right: str) -> bool:
+    # 路径别名和硬链接都不能把已知归档冒充成另一种消费者。
+    if os.path.normcase(os.path.realpath(left)) == os.path.normcase(os.path.realpath(right)):
+        return True
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
 
 
 def resolve_archive(build_dir: str, target: str) -> str:
@@ -185,6 +199,42 @@ def area_of(member: str) -> str:
     return "other"
 
 
+def load_baseline(path: str) -> dict | None:
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            baseline = json.load(handle)
+        symbols = baseline["cross_boundary_symbols"]
+        owning = baseline["owning_stl_symbols"]
+        if (not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols)
+                or len(set(symbols)) != len(symbols) or baseline["count"] != len(symbols)
+                or not isinstance(owning, list) or not all(isinstance(s, str) for s in owning)
+                or len(set(owning)) != len(owning) or baseline["owning_stl_count"] != len(owning)
+                or not set(owning).issubset(symbols)):
+            raise ValueError("inconsistent symbol counts or sets")
+        return baseline
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(f"invalid baseline {path}: {error}") from error
+
+
+def write_json(path: str, data: dict) -> None:
+    """先写临时文件再替换，失败不能留下半份基线。"""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=parent,
+                                         suffix=".json.tmp", delete=False) as handle:
+            temporary = handle.name
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def main() -> int:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
@@ -194,11 +244,17 @@ def main() -> int:
                         help="the build tree holding both archives")
     parser.add_argument("--baseline", default=None,
                         help="baseline json (default: per-toolchain, see the module docstring)")
-    parser.add_argument("--update", action="store_true", help="rewrite the baseline to today's count")
+    parser.add_argument("--update", action="store_true", help="shrink the baseline to today's symbol set")
     parser.add_argument("--list", action="store_true", help="print the worklist, demangled")
     parser.add_argument("--warn", action="store_true",
-                        help="report a growth but exit 0 (the first phase of the CI wiring)")
+                        help="make ordinary checks nonblocking; baseline mutations and flip gate stay strict")
     parser.add_argument("--quiet", action="store_true", help="only report the verdict")
+    parser.add_argument("--initialize", action="store_true", help="create a missing baseline, never overwrite one")
+    parser.add_argument("--consumer", action="append", default=[], help="additional engine/application object or archive")
+    parser.add_argument("--app-object", action="append", default=[],
+                        help="explicit principal application object (for nonstandard build layouts)")
+    parser.add_argument("--report", help="write machine-readable measurement and set delta")
+    parser.add_argument("--require-zero", action="store_true", help="enforce the flip gate, including application evidence")
     args = parser.parse_args()
 
     if args.baseline is None:
@@ -217,16 +273,55 @@ def main() -> int:
     # `vulkancorekit.a` referencing symbols the backend no longer defines, so those references drop
     # out of the intersection and the count FALLS without a line of engine code having changed
     # (measured: 78 -> 76 that way, against 78 -> 77 for the change that was actually made). The
-    # engine archive is the one that has to be at least as new as the backend's, so that is the
-    # direction checked - a warning rather than a failure, because measuring a half-built tree on
-    # purpose is legitimate.
-    if os.path.getmtime(kit_archive) < os.path.getmtime(backend_archive) - 300.0:
-        print("WARNING: the engine archive is more than 5 minutes older than the backend's, so this "
-              "tree may be half-built and the count may UNDER-report. Rebuild both halves before "
-              "believing the number.")
-
+    # Consumers more than 5 minutes older than the backend fail; the build target completes
+    # the product first. This timestamp guard is conservative, not proof of a clean build.
     defined, _ = read_symbols(backend_archive, nm, defined=True)
+    backend_undefined, _ = read_symbols(backend_archive, nm, defined=False)
+    engine_defined, _ = read_symbols(kit_archive, nm, defined=True)
     undefined, kit_members = read_symbols(kit_archive, nm, defined=False)
+
+    # 不只量引擎归档：main/chores 也可能直接引入后端依赖。
+    from pathlib import Path
+    build_path = Path(args.build_dir)
+    application = []
+    chores = []
+    for name in ("libchores.a", "chores.lib"):
+        if (build_path / name).is_file():
+            chores.append(str(build_path / name))
+    application.extend(chores)
+    main_dir = build_path / "CMakeFiles" / "deren.dir"
+    main_objects = []
+    if main_dir.is_dir():
+        main_objects = [str(p) for p in main_dir.rglob("main.cpp.*") if p.suffix in (".obj", ".o")]
+    application.extend(main_objects)
+    application.extend(args.consumer)
+    explicit_app = [p for p in args.app_object if not same_artifact(p, kit_archive)]
+    application.extend(explicit_app)
+    application = list(dict.fromkeys(os.path.abspath(p) for p in application
+                                    if not same_artifact(p, kit_archive)))
+    consumers = [{"file": os.path.abspath(kit_archive), "members": sorted(kit_members)}]
+    stale = []
+    for path in [kit_archive, *application]:
+        if same_artifact(path, backend_archive):
+            print(f"FAIL: backend archive cannot serve as an engine/application consumer: {path}")
+            return 1
+        if not os.path.isfile(path):
+            print(f"FAIL: consumer does not exist: {path}")
+            return 1
+        if os.path.getmtime(path) < os.path.getmtime(backend_archive) - 300.0:
+            stale.append(path)
+        if os.path.abspath(path) == os.path.abspath(kit_archive):
+            continue
+        consumer_defined, _ = read_symbols(path, nm, defined=True)
+        consumer_undefined, members = read_symbols(path, nm, defined=False)
+        engine_defined.update(consumer_defined)
+        consumers.append({"file": path, "members": sorted(members)})
+        for symbol, sites in consumer_undefined.items():
+            undefined[symbol].extend(f"{os.path.basename(path)}:{site}" for site in sites)
+
+    # 后端自己能定义的符号不是反向依赖；归档的不同成员会同时报告 D 和 U。
+    reverse = sorted((set(backend_undefined) - set(defined)) & set(engine_defined))
+    application_evidence = bool(explicit_app) or bool(main_objects and chores)
 
     cross = {s: undefined[s] for s in undefined if s in defined}
     usages = sum(len(undefined[s]) for s in cross)
@@ -243,27 +338,58 @@ def main() -> int:
         "usages": usages,
         "owning_stl_symbols": owning,
         "owning_stl_count": len(owning),
+        "consumers": consumers,
+        "reverse_boundary_symbols": reverse,
+        "stale_consumers": stale,
+        "nm": os.path.abspath(nm),
+        "symbol_sources": cross,
+        "application_evidence": {"complete": application_evidence, "main_objects": main_objects,
+                                 "chores_archives": chores, "explicit_app_objects": explicit_app},
     }
 
-    if args.update:
-        with open(args.baseline, "w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        print(f"check_backend_boundary: baseline updated to {len(symbols)} symbols "
-              f"({usages} sites, {len(owning)} with owning STL, {len(kit_members)} members)"
-              f" -> {args.baseline}")
-        return 0
+    try:
+        baseline = load_baseline(args.baseline)
+    except ValueError as error:
+        print(f"FAIL: {error}")
+        return 1
+    report["joiners"] = sorted(set(symbols) - set(baseline["cross_boundary_symbols"])) if baseline else symbols
+    report["leavers"] = sorted(set(baseline["cross_boundary_symbols"]) - set(symbols)) if baseline else []
+    if args.report:
+        if os.path.normcase(os.path.realpath(args.report)) == os.path.normcase(os.path.realpath(args.baseline)):
+            print("FAIL: report path must differ from baseline path")
+            return 1
+        write_json(args.report, report)
 
-    baseline = None
-    if os.path.isfile(args.baseline):
-        with open(args.baseline, encoding="utf-8") as handle:
-            baseline = json.load(handle)
+    failed = False
+    if stale:
+        print("FAIL: consumers are over 5 minutes older than the backend; rebuild all targets before measuring")
+        for path in stale:
+            print(f"    STALE  {path}")
+        failed = True
+    if reverse:
+        print("FAIL: the backend depends on engine/application symbols")
+        for symbol in reverse:
+            print(f"    REVERSE  {symbol}")
+        failed = True
+    if args.require_zero and (symbols or not application_evidence):
+        print(f"FAIL: flip gate requires zero backend dependencies AND main/chores evidence "
+              f"(or explicit --app-object for another layout; found {len(symbols)} symbols)")
+        failed = True
+    if args.initialize:
+        if baseline is not None or args.update:
+            print("FAIL: --initialize requires a missing baseline and cannot be combined with --update")
+            return 1
+        if failed:
+            return 1
+        write_json(args.baseline, report)
+        print(f"check_backend_boundary: initialized {len(symbols)} symbols -> {args.baseline}")
+        return 0
 
     if not args.quiet:
         print(f"backend  {os.path.basename(backend_archive):<24} "
               f"{len(defined)} defined symbols")
         print(f"engine   {os.path.basename(kit_archive):<24} "
-              f"{len(kit_members)} members, {len(cross)} of them reach into the backend")
+              f"{len(kit_members)} members; {len(cross)} unique backend symbols across {len(consumers)} consumer(s)")
         print(f"usage    {usages} reference sites; {len(owning)} symbol(s) carry owning STL")
         print()
 
@@ -302,17 +428,14 @@ def main() -> int:
 
     if baseline is None:
         print(f"check_backend_boundary: no baseline at {args.baseline}; "
-              f"run --update to record today's {len(symbols)}")
-        return 0
+              f"run --initialize to explicitly record today's {len(symbols)}")
+        return 0 if args.warn and not args.update and not args.require_zero else 1
 
     allowed = int(baseline.get("count", 0))
     allowed_owning = int(baseline.get("owning_stl_count", 0))
-    failed = False
-
-    if len(symbols) > allowed:
-        added = sorted(set(symbols) - set(baseline.get("cross_boundary_symbols", [])))
-        print(f"FAIL: the engine reaches into the backend with {len(symbols)} symbols, "
-              f"baseline is {allowed}")
+    added = report["joiners"]
+    if added:
+        print(f"FAIL: {len(added)} NEW backend dependencies ({len(symbols)} symbols, baseline {allowed})")
         for symbol in added[:20]:
             print(f"    NEW  {symbol}")
         if len(added) > 20:
@@ -327,7 +450,13 @@ def main() -> int:
         failed = True
 
     if failed:
-        return 0 if args.warn else 1
+        return 0 if args.warn and not args.update and not args.require_zero else 1
+
+    if args.update:
+        write_json(args.baseline, report)
+        print(f"check_backend_boundary: baseline ratcheted down to {len(symbols)} symbols "
+              f"({usages} sites, {len(owning)} with owning STL) -> {args.baseline}")
+        return 0
 
     if len(symbols) < allowed:
         print(f"OK (improved): {len(symbols)} symbols, baseline still {allowed} - "
@@ -337,7 +466,10 @@ def main() -> int:
     print(f"OK: {len(symbols)} symbols, baseline {allowed}, {usages} reference sites, "
           f"{len(owning)} with owning STL")
     if allowed == 0:
-        print("the flip gate is closed: nothing on the engine side references a backend symbol")
+        if args.require_zero:
+            print("the measured consumers have zero backend dependencies; DLL import/export gates remain separate")
+        else:
+            print("archive boundary is zero; run --require-zero with application consumers before the flip")
     return 0
 
 
