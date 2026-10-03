@@ -60,7 +60,7 @@
 #
 # References live OUTSIDE the repository (they are machine-specific; committing them would be red for
 # everyone else and would tie every accepted change to a multi-megabyte commit). Override the location
-# with VR_RENDER_BASELINE_DIR. The three `laevatain_*` scenarios are seeded the same way as every other
+# with DEREN_BASELINE_DIR. The three `laevatain_*` scenarios are seeded the same way as every other
 # one - `-Update` copies the frame it just drew to `<baseDir>\<scenario>.png` - and there is no separate
 # seeding path for them; -List prints the directory. NOTE that their ASSETS do not live in the repository
 # either (see $charDir), so those three references are reproducible only on a machine that has the
