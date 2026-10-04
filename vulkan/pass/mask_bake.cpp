@@ -50,7 +50,7 @@ namespace deren::vulkan::pass {
         }
         // Everything the bake reads is a heap slot the shader names itself: the material table (the alpha
         // texture's index, the base colour factor's alpha, the cutoff) and the bindless texture array.
-        auto built = pipelines::build_mask_bake(context.device, spirv);
+        auto built = pipelines::build_mask_bake(context.gpu, spirv);
         if (!built) {
             return std::unexpected(std::move(built.error()));
         }

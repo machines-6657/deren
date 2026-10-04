@@ -14,7 +14,7 @@ module;
 module deren.vulkan.init_utils;
 
 import deren.utility;
-import deren.vulkan.core;
+import deren.vulkan.engine_device;
 
 namespace deren::vulkan::init_utils {
     int32_t default_task_pool_threads() noexcept {
@@ -24,7 +24,7 @@ namespace deren::vulkan::init_utils {
         return static_cast<int32_t>(hw == 0 ? 2u : std::max(1u, hw / 4u));
     }
 
-    void create_host_buffer(core& device,
+    void create_host_buffer(engine_device& device,
                             std::span<std::byte const> const initial,
                             buffer_type const type,
                             std::string_view const what,
@@ -44,7 +44,7 @@ namespace deren::vulkan::init_utils {
         mapped = detail->allocation_info.pMappedData;
     }
 
-    void create_host_buffers(core& device,
+    void create_host_buffers(engine_device& device,
                              uint32_t const slots,
                              std::span<std::byte const> const initial,
                              buffer_type const type,
@@ -67,12 +67,12 @@ namespace deren::vulkan::init_utils {
         }
     }
 
-    std::pair<VkCommandPool, vk_command_buffer> create_recording_pool(core& device) {
+    std::pair<VkCommandPool, vk_command_buffer> create_recording_pool(engine_device& device) {
         VkCommandPool const pool = device.make_command_pool();
         return {pool, device.make_secondary_command_buffer(pool)};
     }
 
-    texture_2d create_texture_2d(core& device,
+    texture_2d create_texture_2d(engine_device& device,
                                  std::span<std::byte const> const pixels,
                                  image_create_info const& info,
                                  std::string_view const what) {

@@ -84,7 +84,7 @@ namespace deren::vulkan::pass {
         }
         // Everything this pass reads is a heap slot the shaders name themselves (the scene buffers, the
         // G-buffer images, the acceleration structure), so the pipeline is all it builds.
-        auto built = pipelines::build_rt_shadow_ray_tracing(context.device, raygen, closest_hit, miss, any_hit);
+        auto built = pipelines::build_rt_shadow_ray_tracing(context.gpu, raygen, closest_hit, miss, any_hit);
         if (!built) {
             deren::utility::log("ray-traced shadows unavailable: {}", built.error());
             this->release_owned();

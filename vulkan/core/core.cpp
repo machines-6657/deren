@@ -209,178 +209,46 @@ namespace deren::vulkan {
     }
 
     bool core::recreate_swap_chain() {
-        // 0. A minimized (or otherwise not-yet-sized) window reports currentExtent (0, 0). Building a
-        //    swapchain and the per-image targets from that is invalid - vkCreateSwapchainKHR
-        //    (VUID-VkSwapchainCreateInfoKHR-imageExtent-01689) and every vkCreateImage
-        //    (VUID-VkImageCreateInfo-extent-00944/-00945) reject a zero extent - and there is nothing
-        //    to render into anyway. Keep the current generation untouched and let the caller retry:
-        //    the frame loop already skips frames whose swapchain extent is zero
-        //    (runtime::pace_and_acquire), and a restore / resize produces a sized window shortly.
         swap_chain_support_details const support = query_swap_chain_support(this->physical_device, this->surface);
         if (support.capabilities.currentExtent.width == 0 || support.capabilities.currentExtent.height == 0) {
             if (!this->zero_extent_recreation_logged) {
                 this->zero_extent_recreation_logged = true;
-                deren::utility::log("swapchain recreation deferred: the window has no drawable size yet (minimized / live resize)");
+                deren::utility::log("swapchain recreation deferred: the window has no drawable size");
             }
-            return false; // NOTHING was rebuilt: the caller must not invalidate the generation's state
+            return false;
         }
         this->zero_extent_recreation_logged = false;
-
-        // 1. Wait for the device to be idle
-        vkDeviceWaitIdle(logical_device);
-
-        // 2. Destroy the scene targets (the G-buffer/velocity/HDR/LDR/bloom set is rebuilt below)
-        for (auto const& view : hdr_image_views) {
-            vkDestroyImageView(logical_device, view, nullptr);
+        if (vkDeviceWaitIdle(this->logical_device) != VK_SUCCESS) {
+            this->fail_initialization(deren::promise::rhi::error::device_lost, "device wait failed during swapchain recreation");
+            return false;
         }
-        hdr_image_views.clear();
-        for (auto const& image : hdr_images) {
-            vkDestroyImage(logical_device, image, nullptr);
-        }
-        hdr_images.clear();
-        for (auto const& memory : hdr_image_memories) {
-            vkFreeMemory(logical_device, memory, nullptr);
-        }
-        hdr_image_memories.clear();
-
-        // 2c. Destroy the display-referred (FXAA input) targets
-        for (auto const& view : ldr_image_views) {
-            vkDestroyImageView(logical_device, view, nullptr);
-        }
-        ldr_image_views.clear();
-        for (auto const& image : ldr_images) {
-            vkDestroyImage(logical_device, image, nullptr);
-        }
-        ldr_images.clear();
-        for (auto const& memory : ldr_image_memories) {
-            vkFreeMemory(logical_device, memory, nullptr);
-        }
-        ldr_image_memories.clear();
-
-        // 2d-2. Destroy the G-buffer targets + the G-buffer pass's own depth image
-        for (auto const& target_views : gbuffer_image_views) {
-            for (auto const& view : target_views) {
-                vkDestroyImageView(logical_device, view, nullptr);
+        for (auto const view : this->swap_chain_image_views)
+            vkDestroyImageView(this->logical_device, view, nullptr);
+        this->swap_chain_image_views.clear();
+        if (this->swap_chain != VK_NULL_HANDLE)
+            vkDestroySwapchainKHR(this->logical_device, this->swap_chain, nullptr);
+        this->swap_chain = VK_NULL_HANDLE;
+        this->swap_chain_images.clear();
+        this->frame_in_flight = false;
+        this->frame_acquired = false;
+        this->init_swap_chain();
+        if (this->startup_error != deren::promise::rhi::error::ok)
+            return false;
+        this->init_image_views();
+        if (this->startup_error != deren::promise::rhi::error::ok)
+            return false;
+        for (auto const semaphore : this->present_ready_semaphores)
+            vkDestroySemaphore(this->logical_device, semaphore, nullptr);
+        this->present_ready_semaphores.assign(this->swap_chain_images.size(), VK_NULL_HANDLE);
+        VkSemaphoreCreateInfo const info = make_binary_semaphore_info();
+        for (auto& semaphore : this->present_ready_semaphores) {
+            if (vkCreateSemaphore(this->logical_device, &info, nullptr, &semaphore) != VK_SUCCESS) {
+                this->fail_initialization(deren::promise::rhi::error::resource_creation_failed, "present-ready semaphore recreation failed");
+                return false;
             }
         }
-        gbuffer_image_views = {};
-        for (auto const& target_images : gbuffer_images) {
-            for (auto const& image : target_images) {
-                vkDestroyImage(logical_device, image, nullptr);
-            }
-        }
-        gbuffer_images = {};
-        for (auto const& target_memories : gbuffer_image_memories) {
-            for (auto const& memory : target_memories) {
-                vkFreeMemory(logical_device, memory, nullptr);
-            }
-        }
-        gbuffer_image_memories = {};
-        for (auto const& view : gbuffer_depth_image_views) {
-            vkDestroyImageView(logical_device, view, nullptr);
-        }
-        gbuffer_depth_image_views.clear();
-        for (auto const& image : gbuffer_depth_images) {
-            vkDestroyImage(logical_device, image, nullptr);
-        }
-        gbuffer_depth_images.clear();
-        for (auto const& memory : gbuffer_depth_image_memories) {
-            vkFreeMemory(logical_device, memory, nullptr);
-        }
-        gbuffer_depth_image_memories.clear();
-
-        // 2d-3. Destroy the motion-vector / TAA working images (same lifetime as the G-buffer)
-        auto const destroy_target_set = [this](std::vector<VkImage>& images, std::vector<VkDeviceMemory>& memories, std::vector<VkImageView>& views) {
-            for (auto const& view : views) {
-                vkDestroyImageView(logical_device, view, nullptr);
-            }
-            views.clear();
-            for (auto const& image : images) {
-                vkDestroyImage(logical_device, image, nullptr);
-            }
-            images.clear();
-            for (auto const& memory : memories) {
-                vkFreeMemory(logical_device, memory, nullptr);
-            }
-            memories.clear();
-        };
-        destroy_target_set(velocity_images, velocity_image_memories, velocity_image_views);
-        destroy_target_set(scene_color_images, scene_color_image_memories, scene_color_image_views);
-        destroy_target_set(taa_history_images, taa_history_image_memories, taa_history_image_views);
-        destroy_target_set(ml_images, ml_image_memories, ml_image_views);
-        destroy_target_set(ml_resolve_images, ml_resolve_image_memories, ml_resolve_image_views);
-        destroy_target_set(ml_history_images, ml_history_image_memories, ml_history_image_views);
-        destroy_target_set(furnace_cube_images, furnace_cube_memories, furnace_cube_views);
-        destroy_target_set(rt_shadow_images, rt_shadow_image_memories, rt_shadow_image_views);
-
-        // 2d. Destroy the bloom targets (all levels)
-        for (auto const& level_views : bloom_image_views) {
-            for (auto const& view : level_views) {
-                vkDestroyImageView(logical_device, view, nullptr);
-            }
-        }
-        bloom_image_views = {};
-        for (auto const& level_images : bloom_images) {
-            for (auto const& image : level_images) {
-                vkDestroyImage(logical_device, image, nullptr);
-            }
-        }
-        bloom_images = {};
-        for (auto const& level_memories : bloom_image_memories) {
-            for (auto const& memory : level_memories) {
-                vkFreeMemory(logical_device, memory, nullptr);
-            }
-        }
-        bloom_image_memories = {};
-
-        // 3. Destroy depth resources
-        for (auto const& view : depth_image_views) {
-            vkDestroyImageView(logical_device, view, nullptr);
-        }
-        depth_image_views.clear();
-
-        for (auto const& image : depth_images) {
-            vkDestroyImage(logical_device, image, nullptr);
-        }
-        depth_images.clear();
-
-        for (auto const& memory : depth_image_memories) {
-            vkFreeMemory(logical_device, memory, nullptr);
-        }
-        depth_image_memories.clear();
-
-        // 4. Destroy swapchain image views
-        for (auto const& image_view : swap_chain_image_views) {
-            vkDestroyImageView(logical_device, image_view, nullptr);
-        }
-        swap_chain_image_views.clear();
-
-        // 5. Destroy the swapchain itself
-        if (swap_chain != VK_NULL_HANDLE) {
-            vkDestroySwapchainKHR(logical_device, swap_chain, nullptr);
-            swap_chain = VK_NULL_HANDLE;
-        }
-
-        // 6. Recreate all resources
-        this->init_swap_chain();        // rebuild swapchain
-        this->init_image_views();       // rebuild image views
-        this->create_depth_resources(); // rebuild depth resources
-        this->create_render_targets();  // rebuild the scene targets
-
-        // Present-ready semaphores are allocated per image index; destroy and rebuild when the
-        // count changes (device is idle here). The per-slot timeline + binary acquire
-        // semaphores are independent of the image count and survive untouched.
-        for (auto const& semaphore : present_ready_semaphores) {
-            vkDestroySemaphore(logical_device, semaphore, nullptr);
-        }
-        present_ready_semaphores.resize(swap_chain_images.size());
-        VkSemaphoreCreateInfo binary_info = make_binary_semaphore_info();
-        for (auto& semaphore : present_ready_semaphores) {
-            if (vkCreateSemaphore(logical_device, &binary_info, nullptr, &semaphore) != VK_SUCCESS) {
-                deren::utility::panic("failed to recreate present-ready semaphore!");
-            }
-        }
-        return true; // a new generation exists: every per-image target and its state must be rebuilt
+        this->color_format = this->swap_chain_image_format;
+        return true;
     }
 
     vk_image_view core::make_depth_image_view(VkImage const image, VkFormat const format) const {

@@ -1,10 +1,10 @@
 // The clustered-light sort's implementation: the shared scene block, the 1D dispatch over the cluster grid and
 // the two buffer barriers that publish its writes. Moved out of `runtime::record_cluster_pass` and
-// `core::make_cluster_pipeline` UNCHANGED in behaviour - the same single set bound at index 0, the same 64-wide
+// `engine_device::make_cluster_pipeline` UNCHANGED in behaviour - the same single set bound at index 0, the same 64-wide
 // workgroup, the same `(count + 63) / 64` group count and the same two COMPUTE_SHADER -> FRAGMENT_SHADER buffer
 // barriers over the same two buffers - so the A/B against the parent commit decides it.
 //
-// It is the first compute pipeline this branch has taken out of `deren.vulkan.core`: `core::make_cluster_pipeline`
+// It is the first compute pipeline this branch has taken out of `deren.vulkan.core`: `engine_device::make_cluster_pipeline`
 // built it against the core's own scene pipeline layout, which a pass cannot own. The replacement builds the
 // same shape in `deren.vulkan.pipelines` (one set layout, no push range - `light_cluster.comp` takes no constants),
 // so what changes is WHO owns the layout, not what the driver is asked for.
@@ -82,7 +82,7 @@ namespace deren::vulkan::pass {
         }
         // NO SET LAYOUT IS ASKED FOR: the pipeline is heap-native (a null layout plus the heap flag), so the
         // pass's descriptors come from the frame's bound heap and not from a set handed over by the owner.
-        auto built = pipelines::build_cluster(context.device, spirv);
+        auto built = pipelines::build_cluster(context.gpu, spirv);
         if (!built) {
             deren::utility::log("clustered lights disabled: {}", built.error());
             this->release_owned();

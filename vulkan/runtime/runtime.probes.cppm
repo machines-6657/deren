@@ -36,7 +36,7 @@ import deren.utility;
 import deren.vulkan.constant_init;
 import deren.vulkan.init_utils;      // the resource-creation patterns the init/ensure functions below repeat
 import deren.vulkan.frame_constants; // one frame's shared constants (see update_frame_constants)
-import deren.vulkan.core.pipeline;   // deren::vulkan::make_pipeline for the post-process pipeline
+import deren.vulkan.engine_gpu;      // deren::vulkan::make_pipeline for the post-process pipeline
 
 // Route std::pmr allocations through mimalloc for this TU (deren.utility:better_pmr). Idempotent:
 // init_pmr() returns the same process-wide singleton no matter which TU calls it first, so
@@ -54,16 +54,16 @@ namespace deren::vulkan {
         // sampler CONSTRUCTED at the use site from a sampler in the sampler heap, and its parameters delivered by
         // vkCmdPushDataEXT. It runs in its own command buffer at scene setup, which is what makes it isolated -
         // the mask bake looked isolated too and turned out to record into the frame's own buffer.
-        core& vk = this->vulkan_core;
-        // Slot 0 of the sampler heap is the texture sampler: the first of the six core::create_samplers makes, in
+        engine_device& vk = this->vulkan_core;
+        // Slot 0 of the sampler heap is the texture sampler: the first of the six engine_device::create_samplers makes, in
         // the order shaders/heap_slots.glsl names (the contract test compares that order, and the host has no
         // per-sampler constant because it keeps them as a list).
-        uint32_t const sampler_slot = static_cast<uint32_t>(core::heap_sampler_base);
+        uint32_t const sampler_slot = static_cast<uint32_t>(engine_device::heap_sampler_base);
         std::span<uint8_t const> const spirv = this->registered_shader("heap_probe.comp.spv");
         if (!vk.descriptor_heaps.ready() || vk.heap_grid_offset == VK_WHOLE_SIZE || spirv.empty()) {
             return; // no heap, no grid or no shader: nothing to probe with, and no heap path to protect
         }
-        auto const built = pipelines::build_heap_probe(vk.logical_device, spirv);
+        auto const built = pipelines::build_heap_probe(vk.gpu, spirv);
         if (!built.has_value()) {
             deren::utility::log("descriptor heap: the heap-native probe's pipeline was refused: {}", built.error());
             return;
@@ -108,20 +108,12 @@ namespace deren::vulkan {
         vkCmdDispatch(command_buffer, 1u, 1u, 1u);
         vkEndCommandBuffer(command_buffer);
 
-        VkFenceCreateInfo const fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = nullptr, .flags = 0};
-        VkFence fence = VK_NULL_HANDLE;
-        vkCreateFence(vk.logical_device, &fence_info, nullptr, &fence);
-        VkSubmitInfo const submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                                     .pNext = nullptr,
-                                     .waitSemaphoreCount = 0,
-                                     .pWaitSemaphores = nullptr,
-                                     .pWaitDstStageMask = nullptr,
-                                     .commandBufferCount = 1,
-                                     .pCommandBuffers = &command_buffer,
-                                     .signalSemaphoreCount = 0,
-                                     .pSignalSemaphores = nullptr};
-        vkQueueSubmit(vk.graphics_queue_handle, 1, &submit, fence);
-        vkWaitForFences(vk.logical_device, 1, &fence, VK_TRUE, UINT64_MAX);
+        VkResult const submitted = vk.submit_and_wait(command_buffer);
+        if (submitted != VK_SUCCESS) {
+            deren::utility::log("descriptor heap: the compute probe's synchronous submission failed (VkResult {})", static_cast<int>(submitted));
+            vkDestroyCommandPool(vk.logical_device, pool, nullptr);
+            return;
+        }
 
         uint32_t const readback = *reinterpret_cast<uint32_t const*>(answer_bytes.data());
         uint32_t const material_readback = reinterpret_cast<uint32_t const*>(answer_bytes.data())[1];
@@ -133,7 +125,6 @@ namespace deren::vulkan {
                             readback >> 16u,
                             material_readback & 0xFFFFu);
 
-        vkDestroyFence(vk.logical_device, fence, nullptr);
         vkDestroyCommandPool(vk.logical_device, pool, nullptr);
     }
 
@@ -149,14 +140,14 @@ namespace deren::vulkan {
         // the two log lines compare the two pipeline kinds directly, and the mesh one is what proves a mesh
         // pipeline can be created heap-natively (the heap flag, a NULL layout) and dispatched with
         // vkCmdDrawMeshTasksEXT at all.
-        core& vk = this->vulkan_core;
+        engine_device& vk = this->vulkan_core;
         std::span<uint8_t const> const vertex_code = this->registered_shader(mesh_shader ? "heap_probe.mesh.spv" : "heap_probe.vert.spv");
         std::span<uint8_t const> const fragment_code = this->registered_shader("heap_probe.frag.spv");
         if (!vk.descriptor_heaps.ready() || vk.heap_grid_offset == VK_WHOLE_SIZE || vertex_code.empty() || fragment_code.empty()) {
             return;
         }
         constexpr VkFormat probe_format = VK_FORMAT_R8G8B8A8_UNORM;
-        auto const built = pipelines::build_heap_probe_graphics(vk.logical_device, probe_format, vertex_code, fragment_code, mesh_shader ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT);
+        auto const built = pipelines::build_heap_probe_graphics(vk.gpu, probe_format, vertex_code, fragment_code, mesh_shader ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT);
         // vkCmdDrawMeshTasksEXT IS AN EXTENSION ENTRY POINT and is loaded the way this project loads every other
         // one (see acceleration_structure.cpp): the loader's import library does not export it, so it arrives
         // through vkGetDeviceProcAddr - and a null there is the honest "this device cannot run this probe"
@@ -276,20 +267,12 @@ namespace deren::vulkan {
 
         vkEndCommandBuffer(command_buffer);
 
-        VkFenceCreateInfo const fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = nullptr, .flags = 0};
-        VkFence fence = VK_NULL_HANDLE;
-        vkCreateFence(vk.logical_device, &fence_info, nullptr, &fence);
-        VkSubmitInfo const submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                                     .pNext = nullptr,
-                                     .waitSemaphoreCount = 0,
-                                     .pWaitSemaphores = nullptr,
-                                     .pWaitDstStageMask = nullptr,
-                                     .commandBufferCount = 1,
-                                     .pCommandBuffers = &command_buffer,
-                                     .signalSemaphoreCount = 0,
-                                     .pSignalSemaphores = nullptr};
-        vkQueueSubmit(vk.graphics_queue_handle, 1, &submit, fence);
-        vkWaitForFences(vk.logical_device, 1, &fence, VK_TRUE, UINT64_MAX);
+        VkResult const submitted = vk.submit_and_wait(command_buffer);
+        if (submitted != VK_SUCCESS) {
+            deren::utility::log("descriptor heap: the {} probe's synchronous submission failed (VkResult {})", mesh_shader ? "MESH" : "GRAPHICS", static_cast<int>(submitted));
+            vkDestroyCommandPool(vk.logical_device, pool, nullptr);
+            return;
+        }
 
         // ---- the host copy itself: no command records it and no queue runs it, and it is legal HERE because the
         //      barrier above has been submitted and waited on (the render's writes are visible to the host stage and
@@ -315,7 +298,6 @@ namespace deren::vulkan {
         VkResult const copied = vk.copy_image_to_memory(vk.logical_device, &copy_info);
         if (copied != VK_SUCCESS) {
             deren::utility::log("descriptor heap: the heap-native {} probe's HOST image copy failed (VkResult {})", mesh_shader ? "MESH" : "GRAPHICS", static_cast<int>(copied));
-            vkDestroyFence(vk.logical_device, fence, nullptr);
             vkDestroyCommandPool(vk.logical_device, pool, nullptr);
             return;
         }
@@ -332,7 +314,6 @@ namespace deren::vulkan {
         deren::utility::log("descriptor heap: the heap-native {} probe read that pixel back through the HOST IMAGE COPY (no staging buffer, no copy command)",
                             mesh_shader ? "MESH" : "GRAPHICS");
 
-        vkDestroyFence(vk.logical_device, fence, nullptr);
         vkDestroyCommandPool(vk.logical_device, pool, nullptr);
     }
 

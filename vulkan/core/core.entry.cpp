@@ -80,7 +80,14 @@ extern "C" DEREN_API_EXPORT rhi::api_core* deren_make_api_core(std::uint32_t abi
     // core.constructor.cppm's `panic` sites), and the spike confirmed that shape. So a
     // non-null return means "the context exists"; there is no partially-built context to
     // report on.
-    return new deren::vulkan::core{*desc};
+    auto* const created = new deren::vulkan::core{*desc};
+    if (!created->initialized) {
+        if (out_error != nullptr)
+            *out_error = created->startup_error;
+        delete created;
+        return nullptr;
+    }
+    return created;
 }
 
 extern "C" DEREN_API_EXPORT void deren_destroy_api_core(rhi::api_core* core) {

@@ -27,33 +27,33 @@ namespace deren::vulkan::ray_tracing {
     namespace {
         /// The contract's view of the device, and the reason EVERY factory and ability call in this file
         /// goes through one of these helpers. `core` implements `api_core`, so a call written on the
-        /// CONCRETE `core&` compiles to a direct call and emits an undefined reference to
-        /// `core::create_buffer` / `core::query_extension` in the engine half - which JOINS the
+        /// CONCRETE `engine_device&` compiles to a direct call and emits an undefined reference to
+        /// `engine_device::create_buffer` / `engine_device::query_extension` in the engine half - which JOINS the
         /// backend-boundary worklist this migration is measured by. Through the contract's interface the
         /// call is virtual and emits no symbol at all.
-        rhi::api_core& contract_of(core& gpu) {
-            return static_cast<rhi::api_core&>(gpu);
+        rhi::api_core& contract_of(engine_device& gpu) {
+            return gpu.gpu.api();
         }
 
         /// The escape, obtained from the contract once and then used through ITS pointer.
-        rhi::vulkan_escape* escape_of(core& gpu) {
+        rhi::vulkan_escape* escape_of(engine_device& gpu) {
             return static_cast<rhi::vulkan_escape*>(contract_of(gpu).query_extension(rhi::extension_kind::vulkan_escape));
         }
 
         /// ... and the address ability the same way (`device_address` is its own tier-2 ability).
-        rhi::device_address* address_of(core& gpu) {
+        rhi::device_address* address_of(engine_device& gpu) {
             return static_cast<rhi::device_address*>(contract_of(gpu).query_extension(rhi::extension_kind::device_address));
         }
 
         /// The borrowed VkBuffer behind a contract buffer; null when the buffer carries none.
-        VkBuffer native_buffer_of(core& gpu, rhi::buffer const& buffer) {
+        VkBuffer native_buffer_of(engine_device& gpu, rhi::buffer const& buffer) {
             auto* const escape = escape_of(gpu);
             return escape == nullptr ? VK_NULL_HANDLE : reinterpret_cast<VkBuffer>(escape->native_buffer(buffer));
         }
 
         /// The device address of a contract buffer created with `rhi::buffer_flag::device_address`; 0 when
         /// the address could not be answered (the flag was not set, or the ability is not announced).
-        VkDeviceAddress buffer_address_of(core& gpu, rhi::buffer const& buffer) {
+        VkDeviceAddress buffer_address_of(engine_device& gpu, rhi::buffer const& buffer) {
             auto* const addresses = address_of(gpu);
             return addresses == nullptr ? 0 : static_cast<VkDeviceAddress>(addresses->buffer_address(buffer, 0));
         }
@@ -66,7 +66,7 @@ namespace deren::vulkan::ray_tracing {
         constexpr rhi::buffer_flags addressable_flag = rhi::to_bits(rhi::buffer_flag::device_address);
     } // namespace
 
-    structure_set::structure_set(core& device_root) noexcept
+    structure_set::structure_set(engine_device& device_root) noexcept
         : device(&device_root) {
     }
 
@@ -162,7 +162,7 @@ namespace deren::vulkan::ray_tracing {
      * @param triangle_count the caster's triangles; 0 makes this a no-op that returns nothing
      * @return the resource, or nullopt when the device does not publish the entry points or an allocation fails
      */
-    std::optional<structure_set::micromap_resource> make_micromap(core& vk, uint32_t const triangle_count) {
+    std::optional<structure_set::micromap_resource> make_micromap(engine_device& vk, uint32_t const triangle_count) {
         if (triangle_count == 0) {
             return std::nullopt;
         }
@@ -351,12 +351,12 @@ namespace deren::vulkan::ray_tracing {
         }
         this->build_attempted = true;
 
-        core& vk = *this->device;
+        engine_device& vk = *this->device;
         auto const start = std::chrono::steady_clock::now();
         this->bottom.emplace(vk);
         // The top level structure is per FRAME SLOT (see its class docs): with frames in flight one buffer would
         // be rewritten by the frame being recorded while the previous one still reads it.
-        this->top_level.emplace(vk, deren::vulkan::core::MAX_FRAMES_IN_FLIGHT);
+        this->top_level.emplace(vk, deren::vulkan::engine_device::MAX_FRAMES_IN_FLIGHT);
         auto& structures = *this->bottom;
 
         uint32_t skipped_no_address = 0;
@@ -702,7 +702,7 @@ namespace deren::vulkan::ray_tracing {
         if (!this->ready()) {
             return {}; // nothing was built (or the build failed): there is nothing to refit or to instance
         }
-        core& vk = *this->device;
+        engine_device& vk = *this->device;
         auto& levels = *this->bottom;
         auto& top = *this->top_level;
 

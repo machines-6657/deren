@@ -19,6 +19,7 @@
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb/stb_image.h>
+import deren.utility.backend_context;
 import deren.vstd;
 import deren.application_configuration;
 import deren.chores; // demo bootstrap helpers (shader loading / dir locating / pipelines)
@@ -491,9 +492,20 @@ int main(int argc, char** argv) {
     //      recorded A/B anchors are byte-identical with this line and without it, which is the measurement
     //      behind the claim. The interactive path (`capture.frames == 0`) is untouched: a normal window.
     core_options.window_visible = capture.frames == 0;
+    auto glfw_check = deren::utility::verify_shared_glfw_runtime();
+    if (!glfw_check) {
+        deren::utility::log("GLFW runtime rejected: {}", glfw_check.error().message);
+        return 1;
+    }
     application_window window{core_options};
     core_options.native_window = window.get();
-    deren::vulkan::runtime runtime{core_options};
+    core_options.window_system = deren::promise::rhi::window_system::glfw;
+    auto backend = deren::utility::load_backend(core_options);
+    if (!backend) {
+        deren::utility::log("Backend startup rejected: {}", backend.error().message);
+        return 1;
+    }
+    deren::vulkan::runtime runtime{std::move(*backend), window.get()};
     runtime.background_color = glm::vec3(settings.render.clear_color[0], settings.render.clear_color[1], settings.render.clear_color[2]);
     // shadow is applied after enable_shadows() below (it needs the shadow maps to exist)
     // per-pass GPU timings (timestamp queries): on by default, reported in the log + overlay

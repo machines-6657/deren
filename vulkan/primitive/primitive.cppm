@@ -39,7 +39,7 @@ module;
 export module deren.vulkan.primitive;
 import deren.promise.rhi; // the contract's buffer handle + object_manager: this module's geometry owners
 export import deren.vstd;
-export import deren.vulkan.core;
+export import deren.vulkan.engine_device;
 export import deren.vulkan.render_environment;
 export import deren.vulkan.scene_tree; // the abstract leaf interface these implement
 export import deren.vulkan.meshlet;    // the meshlet split this primitive's geometry carries (docs/mesh_shaders.md step 3)
@@ -670,7 +670,7 @@ namespace deren::vulkan {
     };
     // THE LANES SPLIT INTO TWO GROUPS, and the split is a fact about the material record rather than a
     // convenience: lanes 0..3 ride `material_record::toon_indices`, and every lane from 4 on is carried BESIDE
-    // the record in `core::heap_slots::toon_lanes` - because the record is INLINE in the per-draw push block
+    // the record in `engine_device::heap_slots::toon_lanes` - because the record is INLINE in the per-draw push block
     // and a word added to it moves every offset in `surface.glsl` and `shadow.slang` (see that slot's note).
     // A lane added at or after `sdf_lightmap` therefore costs a component of that buffer and NOTHING here but
     // an entry in the enum, the format table in `register_material`, and the application's vocabulary table.
@@ -721,7 +721,7 @@ namespace deren::vulkan {
      * A SECOND KIND OF VALUE BESIDE THE TEXTURES, and it needs its own lanes for a reason the texture lanes do not
      * have: a `color` row is four floats - `_EyeHighLightColor` is (2.399, 1.885, 2.038) on chen's iris - so it
      * cannot ride the `uvec4` of texture indices, and the material record has no room for it (see
-     * `core::heap_slots::toon_colours` for why growing the record is not an option here).
+     * `engine_device::heap_slots::toon_colours` for why growing the record is not an option here).
      *
      * ONLY THE LANES SOMETHING READS ARE HERE. The parameter table carries more colours than this (an eye tint, an
      * outline tint, a matcap tint on chen alone); a lane nobody consumes would be a second source of truth for a
@@ -1955,7 +1955,7 @@ namespace deren::vulkan {
          * group draws without a GPU readback.
          *
          * IT IS THE SAME KIND OF FACT AS `overlay_kind` ABOVE AND IS MIRRORED FOR THE SAME REASON: the colour
-         * lanes are uploaded into `core::heap_slots::toon_colours`, one `vec4` per lane per material, and the
+         * lanes are uploaded into `engine_device::heap_slots::toon_colours`, one `vec4` per lane per material, and the
          * per-material `material_record` is fixed at 96 bytes and explicitly refused growth (see the record's
          * own note). The frame's leaf lists are therefore built while the only thing available is the
          * primitive, exactly as they are for the overlay channel - and the shader reads the lane itself for the

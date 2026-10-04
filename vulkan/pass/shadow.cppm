@@ -40,8 +40,8 @@ export module deren.vulkan.pass.shadow;
 
 import deren.vulkan.pass;
 import deren.vulkan.render_resource;
-import deren.vulkan.primitive;    // max_shadow_cascades: the run of layers this pass's declaration claims
-import deren.vulkan.core.handles; // vk_pipeline: the RAII owner of the pipeline this pass builds
+import deren.vulkan.primitive;  // max_shadow_cascades: the run of layers this pass's declaration claims
+import deren.vulkan.engine_gpu; // vk_pipeline: the RAII owner of the pipeline this pass builds
 
 export namespace deren::vulkan::pass {
 

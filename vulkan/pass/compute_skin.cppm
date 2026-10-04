@@ -34,7 +34,7 @@ module;
 export module deren.vulkan.pass.compute_skin;
 
 import deren.vulkan.pass;
-import deren.vulkan.core.handles; // vk_pipeline: the RAII owner of the pipeline this job builds
+import deren.vulkan.engine_gpu; // vk_pipeline: the RAII owner of the pipeline this job builds
 
 export namespace deren::vulkan::pass {
 

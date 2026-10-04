@@ -45,7 +45,9 @@
 module;
 
 #include <cstdint>
+#include <memory>
 #include <span> // std::span: buffer::mapped() hands the caller the bytes of a host-visible buffer
+#include <utility>
 
 export module deren.promise.rhi:api_core;
 
@@ -182,7 +184,77 @@ export namespace deren::promise::rhi {
                                               rgba8_unorm,
                                               rgba8_srgb,
                                               bgra8_unorm,
-                                              bgra8_srgb };
+                                              bgra8_srgb,
+                                              r8_unorm,
+                                              r16_sfloat,
+                                              rg16_sfloat,
+                                              rgba16_sfloat,
+                                              r32_sfloat,
+                                              rg32_sfloat,
+                                              rgba32_sfloat,
+                                              r32_uint,
+                                              d16_unorm,
+                                              d32_sfloat,
+                                              d24_unorm_s8_uint,
+                                              d32_sfloat_s8_uint,
+                                              bc1_rgba_unorm,
+                                              bc1_rgba_srgb,
+                                              bc3_unorm,
+                                              bc3_srgb,
+                                              bc5_unorm,
+                                              bc7_unorm,
+                                              bc7_srgb,
+                                              rg8_unorm,
+                                              rgb8_unorm,
+                                              rgb8_srgb,
+                                              r8_srgb,
+                                              bc1_rgb_unorm,
+                                              bc1_rgb_srgb,
+                                              bc2_unorm,
+                                              bc2_srgb,
+                                              bc4_unorm,
+                                              bc4_snorm,
+                                              bc5_snorm,
+                                              bc6h_ufloat,
+                                              bc6h_sfloat,
+                                              etc2_rgb8_unorm,
+                                              etc2_rgb8_srgb,
+                                              etc2_rgb8a1_unorm,
+                                              etc2_rgb8a1_srgb,
+                                              etc2_rgba8_unorm,
+                                              etc2_rgba8_srgb,
+                                              eac_r11_unorm,
+                                              eac_r11_snorm,
+                                              eac_rg11_unorm,
+                                              eac_rg11_snorm,
+                                              astc_4x4_unorm,
+                                              astc_4x4_srgb,
+                                              astc_5x4_unorm,
+                                              astc_5x4_srgb,
+                                              astc_5x5_unorm,
+                                              astc_5x5_srgb,
+                                              astc_6x5_unorm,
+                                              astc_6x5_srgb,
+                                              astc_6x6_unorm,
+                                              astc_6x6_srgb,
+                                              astc_8x5_unorm,
+                                              astc_8x5_srgb,
+                                              astc_8x6_unorm,
+                                              astc_8x6_srgb,
+                                              astc_8x8_unorm,
+                                              astc_8x8_srgb,
+                                              astc_10x5_unorm,
+                                              astc_10x5_srgb,
+                                              astc_10x6_unorm,
+                                              astc_10x6_srgb,
+                                              astc_10x8_unorm,
+                                              astc_10x8_srgb,
+                                              astc_10x10_unorm,
+                                              astc_10x10_srgb,
+                                              astc_12x10_unorm,
+                                              astc_12x10_srgb,
+                                              astc_12x12_unorm,
+                                              astc_12x12_srgb };
 
     // ---- OWNERSHIP: WHAT `release()` IS, AND WHAT IT IS NOT ---------------------------------------
     //
@@ -257,13 +329,185 @@ export namespace deren::promise::rhi {
         [[nodiscard]] virtual image_format format() const noexcept = 0;
     };
 
-    /// The descriptors of the remaining factories. Opaque until S1 (see the banner).
-    struct image_desc;
-    struct sampler_desc;
-    struct shader_desc;
-    struct pipeline_desc;
-    struct swapchain_desc;
-    struct query_desc;
+    // All spans and strings below are borrowed for the duration of the factory call.
+    // No owning container or allocator crosses the shared-library boundary.
+    enum class image_dimension : std::uint32_t { texture_2d,
+                                                 texture_3d,
+                                                 cube };
+    enum class image_flag : std::uint32_t {
+        sampled = 1u,
+        storage = 2u,
+        color_attachment = 4u,
+        depth_attachment = 8u,
+        transfer_source = 16u,
+        transfer_destination = 32u,
+    };
+    using image_flags = std::uint32_t;
+    [[nodiscard]] constexpr image_flags to_bits(image_flag flag) noexcept {
+        return static_cast<image_flags>(flag);
+    }
+    [[nodiscard]] constexpr bool has_flag(image_flags flags, image_flag flag) noexcept {
+        return (flags & to_bits(flag)) != 0;
+    }
+    struct image_desc {
+        std::uint32_t struct_size = sizeof(image_desc);
+        image_extent extent = {};
+        image_format format = image_format::rgba8_unorm;
+        image_dimension dimension = image_dimension::texture_2d;
+        std::uint32_t mip_levels = 1;
+        std::uint32_t array_layers = 1;
+        image_flags flags = to_bits(image_flag::sampled) | to_bits(image_flag::transfer_destination);
+        std::span<std::byte const> initial_bytes = {};
+        std::uint32_t sample_count = 1;
+    };
+    enum class image_view_dimension : std::uint32_t { texture_2d,
+                                                      texture_2d_array,
+                                                      texture_3d,
+                                                      cube,
+                                                      cube_array };
+    enum class image_aspect : std::uint32_t { color = 1u,
+                                              depth = 2u,
+                                              stencil = 4u };
+    struct image_view_desc {
+        std::uint32_t struct_size = sizeof(image_view_desc);
+        image* resource = nullptr;
+        image_format format = image_format::unknown; // unknown inherits the image's format
+        image_view_dimension dimension = image_view_dimension::texture_2d;
+        std::uint32_t aspects = static_cast<std::uint32_t>(image_aspect::color);
+        std::uint32_t base_mip_level = 0;
+        std::uint32_t mip_level_count = 0; // zero means all remaining
+        std::uint32_t base_array_layer = 0;
+        std::uint32_t array_layer_count = 0;
+    };
+    struct image_view {
+        virtual ~image_view() noexcept = default;
+        virtual void release() noexcept = 0;
+    };
+    enum class filter : std::uint32_t { nearest,
+                                        linear };
+    enum class address_mode : std::uint32_t { repeat,
+                                              mirrored_repeat,
+                                              clamp_to_edge,
+                                              clamp_to_border };
+    enum class compare_op : std::uint32_t { never,
+                                            less,
+                                            equal,
+                                            less_or_equal,
+                                            greater,
+                                            not_equal,
+                                            greater_or_equal,
+                                            always };
+    struct sampler_desc {
+        std::uint32_t struct_size = sizeof(sampler_desc);
+        filter min_filter = filter::linear;
+        filter mag_filter = filter::linear;
+        filter mip_filter = filter::linear;
+        address_mode address_u = address_mode::repeat;
+        address_mode address_v = address_mode::repeat;
+        address_mode address_w = address_mode::repeat;
+        float min_lod = 0.0f;
+        float max_lod = 12.0f;
+        float lod_bias = 0.0f;
+        std::uint32_t anisotropy_enabled = 0;
+        float max_anisotropy = 1.0f;
+        std::uint32_t compare_enabled = 0;
+        compare_op comparison = compare_op::never;
+    };
+    enum class shader_stage : std::uint32_t {
+        vertex,
+        fragment,
+        compute,
+        task,
+        mesh,
+        ray_generation,
+        ray_miss,
+        ray_closest_hit,
+        ray_any_hit,
+        ray_intersection,
+        ray_callable,
+    };
+    struct shader_desc {
+        std::uint32_t struct_size = sizeof(shader_desc);
+        shader_stage stage = shader_stage::vertex;
+        std::span<std::uint8_t const> code = {};
+    };
+    struct shader;
+    struct pipeline_stage {
+        shader_stage stage = shader_stage::vertex;
+        shader* module = nullptr; // module or code, never both
+        std::span<std::uint8_t const> code = {};
+        char const* entry_point = "main";
+    };
+    enum class pipeline_kind : std::uint32_t { graphics,
+                                               compute,
+                                               ray_tracing };
+    enum class blend_factor : std::uint32_t { zero,
+                                              one,
+                                              source_color,
+                                              one_minus_source_color,
+                                              destination_color,
+                                              one_minus_destination_color,
+                                              source_alpha,
+                                              one_minus_source_alpha,
+                                              destination_alpha,
+                                              one_minus_destination_alpha };
+    enum class blend_op : std::uint32_t { add,
+                                          subtract,
+                                          reverse_subtract,
+                                          minimum,
+                                          maximum };
+    struct blend_attachment {
+        std::uint32_t enabled = 0;
+        blend_factor source_color = blend_factor::one;
+        blend_factor destination_color = blend_factor::zero;
+        blend_op color_operation = blend_op::add;
+        blend_factor source_alpha = blend_factor::one;
+        blend_factor destination_alpha = blend_factor::zero;
+        blend_op alpha_operation = blend_op::add;
+        std::uint32_t write_mask = 15u;
+    };
+    enum class ray_group_kind : std::uint32_t { general,
+                                                triangles,
+                                                procedural };
+    inline constexpr std::uint32_t unused_shader = ~0u;
+    struct ray_shader_group {
+        ray_group_kind kind = ray_group_kind::general;
+        std::uint32_t general_shader = unused_shader;
+        std::uint32_t closest_hit_shader = unused_shader;
+        std::uint32_t any_hit_shader = unused_shader;
+        std::uint32_t intersection_shader = unused_shader;
+    };
+    struct pipeline_desc {
+        std::uint32_t struct_size = sizeof(pipeline_desc);
+        pipeline_kind kind = pipeline_kind::graphics;
+        std::span<pipeline_stage const> stages = {};
+        std::span<image_format const> color_formats = {};
+        image_format depth_format = image_format::unknown;
+        std::span<blend_attachment const> blends = {}; // empty = opaque overwrite
+        std::uint32_t sample_count = 1;
+        std::uint32_t depth_test_enabled = 1;
+        compare_op depth_comparison = compare_op::less_or_equal;
+        float depth_bias_constant = 0.0f;
+        float depth_bias_slope = 0.0f;
+        float depth_bias_clamp = 0.0f;
+        // Graphics uses dynamic viewport/scissor/cull/depth-write, exactly as the renderer does.
+        std::span<ray_shader_group const> ray_groups = {};
+        std::uint32_t max_ray_recursion_depth = 1;
+    };
+    // The context has one window/surface. This factory acquires a facade over its current
+    // swapchain generation; its getters follow recreation rather than caching stale images.
+    struct swapchain_desc {
+        std::uint32_t struct_size = sizeof(swapchain_desc);
+    };
+    enum class query_kind : std::uint32_t { timestamp,
+                                            occlusion,
+                                            pipeline_statistics };
+    struct query_desc {
+        std::uint32_t struct_size = sizeof(query_desc);
+        query_kind kind = query_kind::timestamp;
+        std::uint32_t count = 1;
+        std::uint32_t pipeline_statistics = 0; // backend-native statistics bits through Vulkan escape
+    };
 
     /// The remaining tier-1 objects: samplers, shaders, pipelines, swapchains, queries
     /// and command lists.
@@ -296,6 +540,9 @@ export namespace deren::promise::rhi {
         virtual ~swapchain() noexcept = default;
         /// see `buffer::release()`
         virtual void release() noexcept = 0;
+        [[nodiscard]] virtual image_extent extent() const noexcept = 0;
+        [[nodiscard]] virtual image_format format() const noexcept = 0;
+        [[nodiscard]] virtual std::uint32_t image_count() const noexcept = 0;
     };
 
     struct query {
@@ -340,8 +587,15 @@ export namespace deren::promise::rhi {
             : owned_{owned} {
         }
 
+        /// Engine-side token keeps both context and loaded library alive until release completes.
+        object_manager(object* const owned, std::shared_ptr<void> context_token) noexcept
+            : owned_{owned}
+            , context_token_{std::move(context_token)} {
+        }
+
         object_manager(object_manager&& other) noexcept
-            : owned_{other.owned_} {
+            : owned_{other.owned_}
+            , context_token_{std::move(other.context_token_)} {
             other.owned_ = nullptr;
         }
 
@@ -349,6 +603,7 @@ export namespace deren::promise::rhi {
             if (this != &other) {
                 this->reset();
                 this->owned_ = other.owned_;
+                this->context_token_ = std::move(other.context_token_);
                 other.owned_ = nullptr;
             }
             return *this;
@@ -369,6 +624,7 @@ export namespace deren::promise::rhi {
                 this->owned_->release();
                 this->owned_ = nullptr;
             }
+            this->context_token_.reset();
         }
 
         /// give up the reference WITHOUT releasing it (the caller takes over the `release()`)
@@ -382,6 +638,7 @@ export namespace deren::promise::rhi {
             object* const temporary = this->owned_;
             this->owned_ = other.owned_;
             other.owned_ = temporary;
+            this->context_token_.swap(other.context_token_);
         }
 
         [[nodiscard]] object* get() const noexcept {
@@ -402,6 +659,7 @@ export namespace deren::promise::rhi {
 
     private:
         object* owned_ = nullptr;
+        std::shared_ptr<void> context_token_ = {};
     };
 
     struct command_list {
@@ -480,6 +738,7 @@ export namespace deren::promise::rhi {
         [[nodiscard]] virtual swapchain* create_swapchain(swapchain_desc const& desc) = 0;
         [[nodiscard]] virtual buffer* create_buffer(buffer_desc const& desc) = 0;
         [[nodiscard]] virtual image* create_image(image_desc const& desc) = 0;
+        [[nodiscard]] virtual image_view* create_image_view(image_view_desc const& desc) = 0;
         [[nodiscard]] virtual sampler* create_sampler(sampler_desc const& desc) = 0;
         [[nodiscard]] virtual shader* create_shader(shader_desc const& desc) = 0;
         [[nodiscard]] virtual pipeline* create_pipeline(pipeline_desc const& desc) = 0;

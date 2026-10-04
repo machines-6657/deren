@@ -63,7 +63,7 @@ import deren.utility;
  */
 
 export import deren.vstd;
-export import deren.vulkan.core;
+export import deren.vulkan.engine_device;
 export import deren.vulkan.primitive;
 
 export namespace deren::vulkan::ray_tracing {
@@ -160,7 +160,7 @@ export namespace deren::vulkan::ray_tracing {
      */
     class structure_set {
     public:
-        explicit structure_set(core& device_root) noexcept;
+        explicit structure_set(engine_device& device_root) noexcept;
         structure_set(structure_set const&) = delete;
         structure_set& operator=(structure_set const&) = delete;
 
@@ -239,7 +239,7 @@ export namespace deren::vulkan::ray_tracing {
                                                                               uint32_t skin_stride,
                                                                               micromap_resource const* micromap) const noexcept;
 
-        core* device = nullptr;
+        engine_device* device = nullptr;
         std::optional<acceleration_structure::bottom_level_structures> bottom = {};
         /// named `top_level` rather than `top`: `build` keeps a local `auto& top`, and a member of that name
         /// would be hidden by it - MSVC /W4 reports C4458, which /WX makes an error

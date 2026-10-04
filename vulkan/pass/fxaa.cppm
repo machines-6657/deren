@@ -40,8 +40,8 @@ export module deren.vulkan.pass.fxaa;
 
 import deren.vulkan.pass;
 import deren.vulkan.render_resource;
-import deren.vulkan.pass.post;    // post_push_constants: the chain's ONE block, which this pass is mode 3 of
-import deren.vulkan.core.handles; // vk_pipeline: the RAII owner of the pipeline this pass builds
+import deren.vulkan.pass.post;  // post_push_constants: the chain's ONE block, which this pass is mode 3 of
+import deren.vulkan.engine_gpu; // vk_pipeline: the RAII owner of the pipeline this pass builds
 
 export namespace deren::vulkan::pass {
 

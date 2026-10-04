@@ -104,7 +104,7 @@ namespace deren::vulkan::pass {
             deren::utility::log("stochastic punctual lighting's temporal resolve disabled (the chain will stay off): the owner has no {}", shader_name);
             return;
         }
-        auto built = pipelines::build_resolve_pipeline(context.device, spirv);
+        auto built = pipelines::build_resolve_pipeline(context.gpu, spirv);
         if (!built) {
             deren::utility::log("stochastic punctual lighting's temporal resolve disabled (the chain will stay off): {}", built.error());
             this->release_owned();

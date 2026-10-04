@@ -42,7 +42,7 @@ export module deren.vulkan.pass.taa;
 import deren.vulkan.pass;
 import deren.vulkan.render_resource;
 import deren.vulkan.constant_init;
-import deren.vulkan.core.handles; // vk_pipeline: the RAII owner of the pipeline this pass builds
+import deren.vulkan.engine_gpu; // vk_pipeline: the RAII owner of the pipeline this pass builds
 
 export namespace deren::vulkan::pass {
 

@@ -14,18 +14,13 @@ import deren.utility;
 
 namespace deren::vulkan {
     namespace {
-        /// The contract's view of the device. EVERY factory and ability call in this file goes through
-        /// one of these two helpers, and that is a measured rule rather than style: `core` implements
-        /// `api_core`, so a call written on the CONCRETE `core&` compiles to a direct call and emits an
-        /// undefined reference to `core::create_buffer` / `core::query_extension` in the engine half -
-        /// i.e. it JOINS the backend-boundary worklist this migration is measured by. Through the
-        /// contract's interface the call is virtual and emits no symbol at all.
-        deren::promise::rhi::api_core& contract_of(core& gpu) {
-            return static_cast<deren::promise::rhi::api_core&>(gpu);
+        // 工厂通过引擎上下文取得 RHI；engine_device 本身不是后端 api_core 的子类。
+        deren::promise::rhi::api_core& contract_of(engine_device& gpu) {
+            return gpu.gpu.api();
         }
 
         /// The escape, obtained from the contract once and then used through ITS pointer.
-        deren::promise::rhi::vulkan_escape* escape_of(core& gpu) {
+        deren::promise::rhi::vulkan_escape* escape_of(engine_device& gpu) {
             return static_cast<deren::promise::rhi::vulkan_escape*>(
                 contract_of(gpu).query_extension(deren::promise::rhi::extension_kind::vulkan_escape));
         }
@@ -34,7 +29,7 @@ namespace deren::vulkan {
         /// native handle, and the reason the allocator's detail map is consulted nowhere in this class.
         /// Null when the backend announced no escape (it does, and the startup gate refuses a backend
         /// that does not) or when the buffer carries no handle at all.
-        VkBuffer native_buffer_of(core& gpu, deren::promise::rhi::buffer const& buffer) {
+        VkBuffer native_buffer_of(engine_device& gpu, deren::promise::rhi::buffer const& buffer) {
             auto* const escape = escape_of(gpu);
             if (escape == nullptr) {
                 return VK_NULL_HANDLE;
@@ -43,33 +38,15 @@ namespace deren::vulkan {
         }
     } // namespace
 
-    readback::readback(core& device)
+    readback::readback(engine_device& device)
         : gpu(&device) {
     }
 
-    readback::~readback() {
-        // The staging buffer is about to be released, so any copy still referencing it must finish
-        // first: wait() is what guarantees the GPU is done before the allocation goes away.
-        this->wait();
-        if (this->fence != VK_NULL_HANDLE && this->gpu != nullptr) {
-            vkDestroyFence(this->gpu->logical_device, this->fence, nullptr);
-            this->fence = VK_NULL_HANDLE;
-        }
-        // `staging` is a contract owner now: it drops this class's reference on destruction, and the
-        // allocation the copies were writing into dies with the last reference.
-    }
-
-    void readback::wait() {
-        if (!this->fence_pending || this->fence == VK_NULL_HANDLE || this->gpu == nullptr) {
-            return;
-        }
-        vkWaitForFences(this->gpu->logical_device, 1, &this->fence, VK_TRUE, UINT64_MAX);
-        vkResetFences(this->gpu->logical_device, 1, &this->fence);
-        this->fence_pending = false;
-    }
+    // read() 的同步提交在返回前完成，staging 可以直接由契约拥有类型释放。
+    readback::~readback() = default;
 
     std::optional<readback::staged_target> readback::stage_for_copy(VkDeviceSize const size) {
-        core& vk = *this->gpu;
+        engine_device& vk = *this->gpu;
         if (size == 0) {
             return std::nullopt;
         }
@@ -79,10 +56,7 @@ namespace deren::vulkan {
                 return staged_target{.buffer = native_buffer_of(vk, *this->staging), .mapped = current_mapping.data(), .size = static_cast<std::size_t>(size)};
             }
         }
-        // Growing replaces the buffer, so the copy that used the old one has to have completed:
-        // assigning the new owner drops this class's reference to an allocation the GPU may still be
-        // writing into (release is not destruction, but the reference is what keeps it alive).
-        this->wait();
+        // 本类的 read() 同步完成；外部 stage_for_copy() 使用者负责等待自己提交的工作。
         this->staging = deren::promise::rhi::object_manager<deren::promise::rhi::buffer>{
             contract_of(vk).create_buffer(deren::promise::rhi::buffer_desc{.size = size, .usage = deren::promise::rhi::buffer_usage::readback_coherent})};
         this->staging_size = 0;
@@ -103,16 +77,10 @@ namespace deren::vulkan {
     }
 
     std::expected<std::vector<uint8_t>, std::string> readback::read(VkBuffer const source, VkDeviceSize const size, VkDeviceSize const offset) {
-        core& vk = *this->gpu;
+        engine_device& vk = *this->gpu;
         this->last_read_size = 0;
         if (source == VK_NULL_HANDLE || size == 0) {
             return std::unexpected(std::string("readback: nothing to read (null buffer or zero size)"));
-        }
-        if (this->fence == VK_NULL_HANDLE) {
-            VkFenceCreateInfo const fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = nullptr, .flags = 0};
-            if (vkCreateFence(vk.logical_device, &fence_info, nullptr, &this->fence) != VK_SUCCESS) {
-                return std::unexpected(std::string("readback: fence creation failed"));
-            }
         }
         auto const target = this->stage_for_copy(size);
         if (!target) {
@@ -164,24 +132,12 @@ namespace deren::vulkan {
             return std::unexpected(std::string("readback: vkEndCommandBuffer failed"));
         }
 
-        // the fence has just been reset by wait()/creation, so it is unsignaled as submit requires
-        VkSubmitInfo const submit_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                                          .pNext = nullptr,
-                                          .waitSemaphoreCount = 0,
-                                          .pWaitSemaphores = nullptr,
-                                          .pWaitDstStageMask = nullptr,
-                                          .commandBufferCount = 1,
-                                          .pCommandBuffers = &*commands,
-                                          .signalSemaphoreCount = 0,
-                                          .pSignalSemaphores = nullptr};
-        if (vkQueueSubmit(vk.graphics_queue_handle, 1, &submit_info, this->fence) != VK_SUCCESS) {
-            return std::unexpected(std::string("readback: vkQueueSubmit failed"));
+        // 后端统一持有提交锁和同步对象；失败时不能把未完成的映射当作读回结果。
+        VkResult const submitted = vk.submit_and_wait(*commands);
+        if (submitted != VK_SUCCESS) {
+            return std::unexpected(std::string("readback: synchronous submission failed (VkResult ") +
+                                   std::to_string(static_cast<std::int32_t>(submitted)) + ")");
         }
-        this->fence_pending = true;
-
-        vkWaitForFences(vk.logical_device, 1, &this->fence, VK_TRUE, UINT64_MAX);
-        vkResetFences(vk.logical_device, 1, &this->fence);
-        this->fence_pending = false;
 
         // NO INVALIDATE HERE, and it is a deliberate removal rather than an omission. The dropped call
         // asked the allocation's MEMORY TYPE and answered a no-op for this buffer: `readback_coherent`

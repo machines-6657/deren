@@ -225,10 +225,6 @@ namespace deren::vulkan {
         return nullptr;
     }
 
-    rhi::swapchain* core::create_swapchain(rhi::swapchain_desc const& /*desc*/) {
-        return nullptr;
-    }
-
     rhi::buffer* core::create_buffer(rhi::buffer_desc const& declared_desc) {
         // ---- THE ABI GUARD, THEN THE DESCRIPTOR ------------------------------------------------
         // Same rule the context's descriptor follows (core.constructor.cppm): the caller declares how
@@ -240,6 +236,10 @@ namespace deren::vulkan {
         if (desc.size == 0) {
             // A ZERO-BYTE BUFFER IS NOT A BUFFER, and the descriptor asked for nothing. Answering
             // nullptr is the contract's "this descriptor cannot be honoured" (§4.2: no throwing path).
+            return nullptr;
+        }
+        if (!desc.initial_bytes.empty() && desc.initial_bytes.size() != desc.size) {
+            deren::utility::log("rhi: create_buffer initial_bytes size {} differs from allocation {}", desc.initial_bytes.size(), desc.size);
             return nullptr;
         }
 
@@ -322,6 +322,7 @@ namespace deren::vulkan {
         // slot and an acceleration structure's storage ask for, and what a content-keyed allocator must
         // never match against anything.
         auto* const answer = new owned_buffer{};
+        answer->owner = this;
         // `initial_bytes` is the contract's `std::byte` view and the allocator takes `uint8_t const*`:
         // the cast is the boundary between the contract's byte type and VMA's, spelled here so neither
         // side has to know the other's.
@@ -346,10 +347,20 @@ namespace deren::vulkan {
             answer->native = detail->buffer;
             answer->mapped_bytes = detail->allocation_info.pMappedData;
         }
+        if (answer->native == VK_NULL_HANDLE) {
+            delete answer;
+            return nullptr;
+        }
+        this->register_resource(answer, resource_kind::buffer, reinterpret_cast<void*>(answer->native), answer);
         deren::utility::log("rhi: create_buffer {} B usage {} flags {:#x} -> extra {:#x}, native {:#x}, mapped {}",
                             desc.size, static_cast<std::uint32_t>(desc.usage), desc.flags, extra_usage,
                             reinterpret_cast<std::uintptr_t>(answer->native), answer->mapped_bytes != nullptr);
         return answer;
+    }
+
+    core::owned_buffer::~owned_buffer() noexcept {
+        if (this->owner != nullptr)
+            this->owner->unregister_resource(this);
     }
 
     std::uint64_t core::owned_buffer::size() const noexcept {
@@ -373,26 +384,6 @@ namespace deren::vulkan {
         // vma_allocator's own comment says the same). A heap object because the FACTORY made it, so the
         // matching delete is the backend's own operator delete.
         delete this;
-    }
-
-    rhi::image* core::create_image(rhi::image_desc const& /*desc*/) {
-        return nullptr;
-    }
-
-    rhi::sampler* core::create_sampler(rhi::sampler_desc const& /*desc*/) {
-        return nullptr;
-    }
-
-    rhi::shader* core::create_shader(rhi::shader_desc const& /*desc*/) {
-        return nullptr;
-    }
-
-    rhi::pipeline* core::create_pipeline(rhi::pipeline_desc const& /*desc*/) {
-        return nullptr;
-    }
-
-    rhi::query* core::create_query(rhi::query_desc const& /*desc*/) {
-        return nullptr;
     }
 
     rhi::command_list* core::begin_commands() {
@@ -675,8 +666,10 @@ namespace deren::vulkan {
         // does not need one, because the answer it computes (`vkGetBufferDeviceAddress`) is only defined
         // for a buffer this device created in the first place. So: a `static_cast` on a documented
         // precondition, not a hopeful assumption.
-        auto const* const owned = static_cast<owned_buffer const*>(&resource);
-        if (this->owner == nullptr || !owned->addressable) {
+        if (this->owner == nullptr)
+            return 0ull;
+        auto const* const owned = static_cast<owned_buffer const*>(this->owner->find_resource(&resource, resource_kind::buffer).implementation);
+        if (owned == nullptr || !owned->addressable || offset >= owned->size_bytes) {
             // ASKED FOR NOTHING, GET NOTHING: a buffer created without `buffer_flag::device_address` has
             // no address to report (Vulkan only allows the call for a buffer created with that usage),
             // and 0 is the contract's spelling of "none" - the module's own guard, not a failure.
@@ -689,7 +682,7 @@ namespace deren::vulkan {
                                 "bufferDeviceAddress, which is what the flag promised",
                                 reinterpret_cast<std::uintptr_t>(owned->native), owned->declared_flags);
         }
-        return address + offset;
+        return address != 0 && offset <= UINT64_MAX - address ? address + offset : 0ull;
     }
 
     // ---- tier-2: vulkan_escape ---------------------------------------------------------------------
@@ -744,8 +737,9 @@ namespace deren::vulkan {
         // ours, so the cast rests on the documented precondition rather than on a hopeful assumption -
         // and a RELEASED buffer must not reach here at all (touching a released handle is a caller bug
         // the contract names; this would turn it into a crash instead of a wrong answer).
-        auto const* const owned = static_cast<owned_buffer const*>(&resource);
-        return reinterpret_cast<void*>(owned->native);
+        if (&resource == &this->owner->readback_slot_view)
+            return reinterpret_cast<void*>(this->owner->readback_slot_view.handle());
+        return this->owner->find_resource(&resource, resource_kind::buffer).native;
     }
 
     VkResult core::acquire_next_image(uint32_t& image_index) {

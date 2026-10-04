@@ -30,7 +30,9 @@ module;
 #include <GLFW/glfw3.h>
 #include <array>
 #include <cstddef>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <vulkan/vulkan.h>
 
@@ -221,6 +223,9 @@ namespace deren::vulkan {
         // creation options this core was built with (window size, vsync); the window and the
         // swap chain honor them
         deren::promise::rhi::create_info create_options = {};
+        bool initialized = false;
+        deren::promise::rhi::error startup_error = deren::promise::rhi::error::ok;
+        void fail_initialization(deren::promise::rhi::error reason, std::string_view message) noexcept;
 
         // ---- S2 BATCH 2: THE RECORDING SURFACE, THE FRAME'S VIEWS AND THE ESCAPE --------------------
         //
@@ -306,6 +311,8 @@ namespace deren::vulkan {
         /// pointer into that map must not be kept, the VALUES read out of it may be. That is the rule
         /// the ownership analysis (DYNAMIC_LINK_V2.md §11.2) says every contract query has to follow.
         struct owned_buffer final : deren::promise::rhi::buffer {
+            core* owner = nullptr;
+            ~owned_buffer() noexcept override;
             deren::vulkan::vk_buffer owned = {};
             /// the Vulkan handle, cached at creation: `vk_buffer::handle()` is the ALLOCATOR's registry
             /// key (a uint64), not the `VkBuffer`, and reaching the real handle means a detail lookup -
@@ -364,7 +371,35 @@ namespace deren::vulkan {
             /// BORROWED: the `VkBuffer` behind a contract buffer this backend handed out (nullptr when it
             /// carries none). A released buffer must not be passed - see the contract's note.
             [[nodiscard]] void* native_buffer(deren::promise::rhi::buffer const& resource) const noexcept override;
+            [[nodiscard]] void* native_image(deren::promise::rhi::image const& resource) const noexcept override;
+            [[nodiscard]] void* native_image_view(deren::promise::rhi::image_view const& resource) const noexcept override;
+            [[nodiscard]] void* native_sampler(deren::promise::rhi::sampler const& resource) const noexcept override;
+            [[nodiscard]] void* native_shader(deren::promise::rhi::shader const& resource) const noexcept override;
+            [[nodiscard]] void* native_pipeline(deren::promise::rhi::pipeline const& resource) const noexcept override;
+            [[nodiscard]] void* native_query(deren::promise::rhi::query const& resource) const noexcept override;
+            [[nodiscard]] void* native_swapchain(deren::promise::rhi::swapchain const& resource) const noexcept override;
+            [[nodiscard]] deren::promise::rhi::error service(deren::promise::rhi::vulkan_service operation, void* payload, std::uint32_t payload_size) noexcept override;
         };
+
+        // 后端内部注册表验证资源归属；跨 DLL 仅暴露虚接口，不能靠 RTTI 猜类型。
+        enum class resource_kind { buffer,
+                                   image,
+                                   image_view,
+                                   sampler,
+                                   shader,
+                                   pipeline,
+                                   query,
+                                   swapchain };
+        struct resource_record {
+            resource_kind kind = resource_kind::image;
+            void* native = nullptr;
+            void* implementation = nullptr;
+        };
+        mutable std::mutex resource_mutex = {};
+        std::map<void const*, resource_record> resource_handles = {};
+        void register_resource(void const* resource, resource_kind kind, void* native, void* implementation);
+        void unregister_resource(void const* resource) noexcept;
+        [[nodiscard]] resource_record find_resource(void const* resource, resource_kind kind) const noexcept;
 
         // ---- WHAT THE RECORDING SURFACE OWNS --------------------------------------------------------
         //
@@ -503,6 +538,7 @@ namespace deren::vulkan {
         [[nodiscard]] deren::promise::rhi::swapchain* create_swapchain(deren::promise::rhi::swapchain_desc const& desc) override;
         [[nodiscard]] deren::promise::rhi::buffer* create_buffer(deren::promise::rhi::buffer_desc const& desc) override;
         [[nodiscard]] deren::promise::rhi::image* create_image(deren::promise::rhi::image_desc const& desc) override;
+        [[nodiscard]] deren::promise::rhi::image_view* create_image_view(deren::promise::rhi::image_view_desc const& desc) override;
         [[nodiscard]] deren::promise::rhi::sampler* create_sampler(deren::promise::rhi::sampler_desc const& desc) override;
         [[nodiscard]] deren::promise::rhi::shader* create_shader(deren::promise::rhi::shader_desc const& desc) override;
         [[nodiscard]] deren::promise::rhi::pipeline* create_pipeline(deren::promise::rhi::pipeline_desc const& desc) override;

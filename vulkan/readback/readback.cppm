@@ -23,14 +23,14 @@ export module deren.vulkan.readback;
 
 import deren.promise.rhi; // the contract's staging-buffer handle + object_manager
 export import deren.vstd;
-export import deren.vulkan.core;
+export import deren.vulkan.engine_device;
 
 /**
  * @file vulkan/readback/readback.cppm
  * @defgroup vulkan_readback GPU -> CPU Readback
  * @brief Copies a range of a device buffer into host memory, synchronously.
  *
- * One staging buffer sized to the largest request so far, one fence, one command buffer per call:
+ * One staging buffer sized to the largest request so far, one command buffer per call:
  * `read()` records the copy, submits it alone on the graphics queue, waits for that submission and
  * hands back the bytes. The wait is the point - the caller gets data, not a promise, which is what
  * makes this usable from a debug dump, a headless check or a screenshot without any of them having
@@ -48,34 +48,27 @@ namespace deren::vulkan {
     /**
      * @ingroup vulkan_readback
      * @brief reusable GPU -> CPU readback of buffer ranges
-     * @note not thread safe: it owns one staging buffer, one fence and the mapped view of them, so a
+     * @note not thread safe: it owns one staging buffer and its mapped view, so a
      *       second concurrent read would resize or reset them under the first one's copy
      */
     export class readback {
         // non-const: the copies go through the contract's factory and the queue, and neither
         // `create_buffer()` nor the submit path is a const operation
-        /// Deliberately NOT called `vk`: stage_for_copy() and read() bind a local `core& vk`, and that
+        /// Deliberately NOT called `vk`: stage_for_copy() and read() bind a local `engine_device& vk`, and that
         /// local would hide a member of the same name - MSVC /W4 reports C4458, an error under /WX
         /// (clang does not warn: -Wshadow is not enabled there).
-        core* gpu = nullptr;
+        engine_device* gpu = nullptr;
         /// host-visible + coherent + TRANSFER_DST, grown on demand (see stage_for_copy). The contract's
         /// owner keeps the allocation alive for as long as this member lives, and the native handle and
         /// the mapping are asked OF THE HANDLE where they are needed (`vulkan_escape::native_buffer()` /
         /// `buffer::mapped()`) rather than cached beside it.
         deren::promise::rhi::object_manager<deren::promise::rhi::buffer> staging = {};
         VkDeviceSize staging_size = 0;
-        /// the one-shot submit's fence. Created lazily, reset by wait(), and only meaningful while a
-        /// copy is in flight - `fence_pending` records whether it was signaled.
-        VkFence fence = VK_NULL_HANDLE;
-        bool fence_pending = false;
         /// the size the last `read()` produced, for total_size()
         std::size_t last_read_size = 0;
 
-        /// wait for the in-flight copy and reset the fence; safe to call with nothing in flight
-        void wait();
-
     public:
-        explicit readback(core& device);
+        explicit readback(engine_device& device);
         readback(readback const&) = delete;
         readback& operator=(readback const&) = delete;
         readback(readback&&) = delete;

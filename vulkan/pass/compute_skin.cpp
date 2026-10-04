@@ -51,7 +51,7 @@ namespace deren::vulkan::pass {
         }
         // The per-joint matrices the dispatch reads are a heap slot the shader names itself (see the header), so
         // nothing about the renderer's buffers is handed in and the pipeline is all this job builds.
-        auto built = pipelines::build_compute_skin(context.device, spirv);
+        auto built = pipelines::build_compute_skin(context.gpu, spirv);
         if (!built) {
             return std::unexpected(std::move(built.error()));
         }

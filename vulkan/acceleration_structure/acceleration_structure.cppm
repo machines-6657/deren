@@ -27,7 +27,7 @@ export module deren.vulkan.acceleration_structure;
 
 import deren.promise.rhi; // the contract's buffer handle + object_manager: the storage/scratch owners
 export import deren.vstd;
-export import deren.vulkan.core;
+export import deren.vulkan.engine_device;
 
 /**
  * @file vulkan/acceleration_structure/acceleration_structure.cppm
@@ -197,10 +197,10 @@ namespace deren::vulkan::acceleration_structure {
             std::vector<VkAccelerationStructureGeometryKHR> geometries = {}; // one per entry, kept alive
         };
 
-        /// Deliberately NOT called `vk`: add() and record_build() bind a local `core& vk`, and that
+        /// Deliberately NOT called `vk`: add() and record_build() bind a local `engine_device& vk`, and that
         /// local would hide a member of the same name - MSVC /W4 reports C4458, an error under /WX
         /// (clang does not warn: -Wshadow is not enabled there).
-        core* gpu = nullptr; // non-const: VMA's detail lookups and buffer creation are not const
+        engine_device* gpu = nullptr; // non-const: VMA's detail lookups and buffer creation are not const
         std::vector<entry> entries = {};
         /// The extension entry points, resolved per device in the constructor. Declared incomplete here
         /// and defined in the .cpp, because a function pointer table is implementation detail - and a
@@ -244,7 +244,7 @@ namespace deren::vulkan::acceleration_structure {
         std::deque<micromap_attachment> micromap_geometries = {};
 
     public:
-        explicit bottom_level_structures(core& device);
+        explicit bottom_level_structures(engine_device& device);
         bottom_level_structures(bottom_level_structures const&) = delete;
         bottom_level_structures& operator=(bottom_level_structures const&) = delete;
         bottom_level_structures(bottom_level_structures&&) = delete;
@@ -340,10 +340,10 @@ namespace deren::vulkan::acceleration_structure {
             deren::promise::rhi::object_manager<deren::promise::rhi::buffer> scratch = {}; // the build's scratch memory, kept once sized
         };
 
-        /// Deliberately NOT called `vk`: add() and record_build() bind a local `core& vk`, and that
+        /// Deliberately NOT called `vk`: add() and record_build() bind a local `engine_device& vk`, and that
         /// local would hide a member of the same name - MSVC /W4 reports C4458, an error under /WX
         /// (clang does not warn: -Wshadow is not enabled there).
-        core* gpu = nullptr; // non-const: VMA's detail lookups and buffer creation are not const
+        engine_device* gpu = nullptr; // non-const: VMA's detail lookups and buffer creation are not const
         /// The extension entry points, forward-declared and held by pointer for the same reason (and with the
         /// same NO-initializer rule) as `bottom_level_structures::functions` above - see the note there.
         struct entry_points;
@@ -353,7 +353,7 @@ namespace deren::vulkan::acceleration_structure {
         build_stats stats = {};
 
     public:
-        explicit top_level_structure(core& device, uint32_t frame_slot_count);
+        explicit top_level_structure(engine_device& device, uint32_t frame_slot_count);
         top_level_structure(top_level_structure const&) = delete;
         top_level_structure& operator=(top_level_structure const&) = delete;
         top_level_structure(top_level_structure&&) = delete;

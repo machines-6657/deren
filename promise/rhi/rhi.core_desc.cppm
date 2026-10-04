@@ -51,6 +51,9 @@ export module deren.promise.rhi:core_desc;
 
 export namespace deren::promise::rhi {
 
+    enum class window_system : std::uint32_t { none,
+                                               glfw };
+
     /**
      * @ingroup promise
      * @brief how the program asks for a backend context: window geometry and title, presentation and
@@ -86,6 +89,8 @@ export namespace deren::promise::rhi {
         /// a window the CALLER owns (an HWND/GLFWwindow*/whatever the backend understands), or null to
         /// have the backend create one. Borrowed, never freed by the backend.
         void* native_window = nullptr;
+        /// The opaque handle is only meaningful together with its window-system tag.
+        rhi::window_system window_system = rhi::window_system::none;
     };
 
 } // namespace deren::promise::rhi

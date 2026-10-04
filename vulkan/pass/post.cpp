@@ -73,7 +73,7 @@ namespace deren::vulkan::pass {
         // The SURFACE's format is one of the two pipelines' (the other renders into R16F bloom levels and into
         // the LDR image FXAA reads), and it is a session-stable device fact the context carries for exactly this
         // kind of reason (see pass_context::swap_chain_image_format).
-        auto built = pipelines::build_post(context.device, context.swap_chain_image_format, vertex_spirv, fragment_spirv);
+        auto built = pipelines::build_post(context.gpu, context.swap_chain_image_format, vertex_spirv, fragment_spirv);
         if (!built) {
             deren::utility::log("post chain disabled: {}", built.error());
             this->release_owned();

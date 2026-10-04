@@ -82,7 +82,7 @@ namespace deren::vulkan::pass {
         // The blend state is the stage's own: the attachment is LOADed and the lighting ADDS to the emissive the
         // G-buffer pass wrote.
         std::array<VkPipelineColorBlendAttachmentState, 1> const blend = {make_color_blend_attachment_additive()};
-        auto built = pipelines::build_deferred(context.device,
+        auto built = pipelines::build_deferred(context.gpu,
                                                std::span<VkPipelineColorBlendAttachmentState const>(blend), vertex_spirv, fragment_spirv);
         if (!built) {
             deren::utility::log("deferred lighting disabled: {}", built.error());

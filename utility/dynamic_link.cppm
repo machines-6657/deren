@@ -17,10 +17,10 @@ import deren.vstd;
 //
 // Windows: LoadLibraryExW, never LoadLibraryA / the LoadLibrary macro (m02099).
 //   - an absolute path is loaded with LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-//     LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: only the DLL's own directory and the standard
-//     system directories are searched, never %PATH% (DLL planting);
+//     LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32: only the
+//     DLL directory, EXE directory and System32 are searched, never PATH or user-added dirs;
 //   - a name without a path separator takes the classic search order instead, because
-//     those two flags reject a relative path with ERROR_INVALID_PARAMETER;
+//     these search flags reject a relative path with ERROR_INVALID_PARAMETER;
 //   - the path is UTF-8 and is converted with MultiByteToWideChar(CP_UTF8).
 // POSIX: dlopen/dlsym/dlclose with explicit RTLD_NOW | RTLD_LOCAL. DynamicLink's
 //   global GetFlag()/SetFlag() state is deliberately not copied: the flags belong to
@@ -50,7 +50,8 @@ extern "C" __declspec(dllimport) void* __stdcall LocalFree(void* memory);
 namespace {
     // From winbase.h / winnls.h, copied instead of included for the reason above.
     constexpr unsigned long load_library_search_dll_load_dir = 0x00000100ul;
-    constexpr unsigned long load_library_search_default_dirs = 0x00001000ul;
+    constexpr unsigned long load_library_search_application_dir = 0x00000200ul;
+    constexpr unsigned long load_library_search_system32 = 0x00000800ul;
     constexpr unsigned int code_page_utf8 = 65001u;
     constexpr unsigned long format_message_allocate_buffer = 0x00000100ul;
     constexpr unsigned long format_message_from_system = 0x00001000ul;
@@ -336,7 +337,9 @@ namespace deren::utility::dynamic_link {
                 load_error{0, std::format("'{}' cannot be converted to a UTF-16 path", path)});
         }
         unsigned long const flags =
-            is_absolute_path(path) ? (load_library_search_dll_load_dir | load_library_search_default_dirs) : 0ul;
+            is_absolute_path(path) ? (load_library_search_dll_load_dir | load_library_search_application_dir |
+                                      load_library_search_system32)
+                                   : 0ul;
         void* const handle = LoadLibraryExW(wide.data(), nullptr, flags);
         if (handle == nullptr) {
             unsigned long const code = GetLastError();

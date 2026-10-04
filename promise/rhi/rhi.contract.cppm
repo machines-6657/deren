@@ -80,7 +80,8 @@ export namespace deren::promise::rhi {
     /// reaches through is a different shape, which is the case this number exists for. It is the call
     /// that lets an escaping pass use a contract buffer's raw handle instead of the allocator's detail
     /// map, i.e. one more way for the engine to stop reaching into the backend.
-    inline constexpr std::uint32_t abi_version = 6u;
+    /// 6 -> 7 freezes product resource descriptors and extends the native resource escape.
+    inline constexpr std::uint32_t abi_version = 7u;
 
     /// Why a promise entry point could not do what it was asked.
     ///
@@ -97,6 +98,11 @@ export namespace deren::promise::rhi {
         invalid_argument = 9, ///< the region does not fit the image, or the destination is too small
         not_ready = 10,       ///< no frame is in flight, or the frame that drew it is not done
         device_lost = 11,     ///< the device refused the submission/copy (VkResult failure)
+        instance_creation_failed = 12,
+        surface_creation_failed = 13,
+        device_creation_failed = 14,
+        swapchain_creation_failed = 15,
+        resource_creation_failed = 16,
     };
 
 } // namespace deren::promise::rhi

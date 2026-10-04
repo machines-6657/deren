@@ -19,8 +19,8 @@ module deren.vulkan.pass.toon_screen_rim;
 
 import deren.vulkan.render_resource;
 import deren.vulkan.constant_init;
-import deren.vulkan.core;          // deren::vulkan::hdr_format: the one target this pass writes
-import deren.vulkan.core.pipeline; // deren::vulkan::make_pipeline: the generic builder this pass uses directly
+import deren.vulkan.engine_device; // deren::vulkan::hdr_format: the one target this pass writes
+import deren.vulkan.engine_gpu;    // deren::vulkan::make_pipeline: the generic builder this pass uses directly
 import deren.utility;
 
 namespace deren::vulkan::pass {
@@ -78,7 +78,7 @@ namespace deren::vulkan::pass {
         // ADDITIVE: the rim is a contribution to the frame, not a replacement for it. This is the opposite of
         // the character-forward stage's overwrite, and the two are deliberately different passes for it.
         std::array<VkPipelineColorBlendAttachmentState, 1> const blends = {make_color_blend_attachment_additive()};
-        auto built = deren::vulkan::make_pipeline(context.device,
+        auto built = deren::vulkan::make_pipeline(context.gpu,
                                                   std::span<VkFormat const>(formats),
                                                   VK_FORMAT_UNDEFINED, // NO depth attachment: the depth is sampled, not tested
                                                   vertex_spirv,

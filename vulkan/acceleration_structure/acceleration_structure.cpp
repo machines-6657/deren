@@ -22,33 +22,33 @@ namespace deren::vulkan::acceleration_structure {
     namespace {
         /// The contract's view of the device, and the reason EVERY factory and ability call in this file
         /// goes through one of these helpers. `core` implements `api_core`, so a call written on the
-        /// CONCRETE `core&` compiles to a direct call and emits an undefined reference to
-        /// `core::create_buffer` / `core::query_extension` in the engine half - which JOINS the
+        /// CONCRETE `engine_device&` compiles to a direct call and emits an undefined reference to
+        /// `engine_device::create_buffer` / `engine_device::query_extension` in the engine half - which JOINS the
         /// backend-boundary worklist this migration is measured by. Through the contract's interface the
         /// call is virtual and emits no symbol at all.
-        rhi::api_core& contract_of(core& gpu) {
-            return static_cast<rhi::api_core&>(gpu);
+        rhi::api_core& contract_of(engine_device& gpu) {
+            return gpu.gpu.api();
         }
 
         /// The escape, obtained from the contract once and then used through ITS pointer.
-        rhi::vulkan_escape* escape_of(core& gpu) {
+        rhi::vulkan_escape* escape_of(engine_device& gpu) {
             return static_cast<rhi::vulkan_escape*>(contract_of(gpu).query_extension(rhi::extension_kind::vulkan_escape));
         }
 
         /// ... and the address ability the same way (`device_address` is its own tier-2 ability).
-        rhi::device_address* address_of(core& gpu) {
+        rhi::device_address* address_of(engine_device& gpu) {
             return static_cast<rhi::device_address*>(contract_of(gpu).query_extension(rhi::extension_kind::device_address));
         }
 
         /// The borrowed VkBuffer behind a contract buffer; null when the buffer carries none.
-        VkBuffer native_buffer_of(core& gpu, rhi::buffer const& buffer) {
+        VkBuffer native_buffer_of(engine_device& gpu, rhi::buffer const& buffer) {
             auto* const escape = escape_of(gpu);
             return escape == nullptr ? VK_NULL_HANDLE : reinterpret_cast<VkBuffer>(escape->native_buffer(buffer));
         }
 
         /// The device address of a contract buffer created with `rhi::buffer_flag::device_address`; 0 when
         /// the address could not be answered (the flag was not set, or the ability is not announced).
-        VkDeviceAddress buffer_address_of(core& gpu, rhi::buffer const& buffer) {
+        VkDeviceAddress buffer_address_of(engine_device& gpu, rhi::buffer const& buffer) {
             auto* const addresses = address_of(gpu);
             return addresses == nullptr ? 0 : static_cast<VkDeviceAddress>(addresses->buffer_address(buffer, 0));
         }
@@ -100,7 +100,7 @@ namespace deren::vulkan::acceleration_structure {
         }
     };
 
-    bottom_level_structures::bottom_level_structures(core& device)
+    bottom_level_structures::bottom_level_structures(engine_device& device)
         : gpu(&device)
         , functions(std::make_unique<entry_points>()) {
         if (!this->functions->load(device.logical_device)) {
@@ -121,7 +121,7 @@ namespace deren::vulkan::acceleration_structure {
     }
 
     std::expected<uint32_t, std::string> bottom_level_structures::add(geometry_source const& source, bool const refittable) {
-        core& vk = *this->gpu;
+        engine_device& vk = *this->gpu;
         // Every geometry gets an entry, even one with nothing to build: the caller's index into this
         // list is the caller's index into its own geometry array, and skipping one silently would
         // shift every later index by one.
@@ -247,7 +247,7 @@ namespace deren::vulkan::acceleration_structure {
     }
 
     std::expected<void, std::string> bottom_level_structures::record_build(VkCommandBuffer const command_buffer) {
-        core& vk = *this->gpu;
+        engine_device& vk = *this->gpu;
         auto const start = std::chrono::steady_clock::now();
 
         if (this->entries.empty()) {
@@ -390,7 +390,7 @@ namespace deren::vulkan::acceleration_structure {
         }
     };
 
-    top_level_structure::top_level_structure(core& device, uint32_t const frame_slot_count)
+    top_level_structure::top_level_structure(engine_device& device, uint32_t const frame_slot_count)
         : gpu(&device)
         , functions(std::make_unique<entry_points>())
         , slots(frame_slot_count) {
@@ -421,7 +421,7 @@ namespace deren::vulkan::acceleration_structure {
     }
 
     std::expected<void, std::string> top_level_structure::add(bottom_level_structures const& levels, instance_source const& source) {
-        core& vk = *this->gpu;
+        engine_device& vk = *this->gpu;
         if (this->current_slot >= this->slots.size()) {
             return std::unexpected(std::string("acceleration structures: no frame slot is being built"));
         }
@@ -537,7 +537,7 @@ namespace deren::vulkan::acceleration_structure {
     }
 
     std::expected<void, std::string> top_level_structure::record_build(VkCommandBuffer const command_buffer) {
-        core& vk = *this->gpu;
+        engine_device& vk = *this->gpu;
         auto const start = std::chrono::steady_clock::now();
         slot& target = this->slots[this->current_slot];
         if (target.count == 0 || target.handle == VK_NULL_HANDLE) {

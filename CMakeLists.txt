@@ -49,41 +49,8 @@ else()
     find_package(glm REQUIRED)
 endif()
 
-# GLFW (window + input): linked STATICALLY so the released exe carries no glfw3.dll.
-# The MSYS2 clang64 package's own CMake config exports a SHARED import (libglfw3.dll.a),
-# so we do not use find_package(glfw3): a plain INTERFACE target linking the bare name
-# would now resolve to that shared import (the exe no longer links with -static - see the
-# link-options block below), which is why the interface names libglfw3.a outright, and
-# crucially does NOT define GLFW_DLL (the dynamic-import macro static builds must not see).
-# Headers live on the compiler's implicit include path; an explicit dir is added when found.
-#
-# THE EXCEPTION IS MSVC, where `glfw3` is not a library name at all (that bare-name convention is the
-# MinGW one). The official GLFW binary release ships include/ plus lib-vc2022/glfw3.lib, so
-# VR_GLFW_ROOT points at the unpacked release directory and both the headers and the .lib come from
-# there. lib-vc2022/glfw3.lib is an /MD (dynamic CRT) build, which is why the MSVC branch of the
-# compile options leaves the CRT at its own default.
-set(VR_GLFW_ROOT "" CACHE PATH "Unpacked GLFW binary release (the directory holding include/ and lib-vc2022/); required for MSVC builds")
-add_library(glfw INTERFACE)
-if(WIN32)
-    if(VR_GLFW_ROOT)
-        target_include_directories(glfw SYSTEM INTERFACE "${VR_GLFW_ROOT}/include")
-        find_library(VR_GLFW_LIBRARY NAMES glfw3 glfw3_mt
-                PATHS "${VR_GLFW_ROOT}/lib-vc2022" "${VR_GLFW_ROOT}/lib-mingw-w64"
-                NO_DEFAULT_PATH REQUIRED)
-        target_link_libraries(glfw INTERFACE ${VR_GLFW_LIBRARY} gdi32)
-    else()
-        # MINGW ONLY: a bare `glfw3` is "the linker's choice", and that choice is the SHARED import
-        # (libglfw3.dll.a) whenever the executable is not linked with -static. The C++ runtime is
-        # dynamic now (see the link-options block below), so the static archive is named explicitly
-        # here instead - the released exe must still carry no glfw3.dll (see the note above).
-        find_library(VR_GLFW_STATIC_LIBRARY NAMES libglfw3.a REQUIRED)
-        target_link_libraries(glfw INTERFACE ${VR_GLFW_STATIC_LIBRARY} gdi32) # glfw3.pc: Libs.private = -lgdi32
-    endif()
-else()
-    find_package(Threads REQUIRED)
-    find_library(GLFW_LIBRARY NAMES glfw3 REQUIRED)
-    target_link_libraries(glfw INTERFACE ${GLFW_LIBRARY} Threads::Threads)
-endif()
+# GLFW 的初始化/平台状态必须在应用和后端之间共享；实现和路径检查集中在此文件。
+include(cmake/SharedGlfw.cmake)
 
 # =============================================================================================
 # COMPILER DIALECT - the one place a GNU/Clang spelling and an MSVC spelling are told apart.
@@ -326,7 +293,7 @@ target_compile_definitions(app_config PRIVATE TOML_EXCEPTIONS=0)
 # listed below, and NOTHING about render passes.
 #
 # WHY A TARGET AND NOT A DIRECTORY MOVE: every consumer of the backend keeps using vulkancorekit
-# unchanged (the BMI comes across through `target_link_libraries(vulkancorekit PUBLIC deren_vulkan)`,
+# unchanged (the BMI comes across through `target_link_libraries(vulkancorekit PUBLIC promise deren_backend_host deren_gpu_constants)`,
 # the shape utility / vstd_lib already have). Products are expected to be byte-identical: same TUs,
 # same flags, same executable - S1-A is the one step of S1 that is constructive.
 #
@@ -353,11 +320,8 @@ option(DEREN_BACKEND_SPIKE
         "build deren_vulkan as a SHARED library plus the boundary spike test (S2 spike; the engine targets will not link)"
         OFF)
 
-if(DEREN_BACKEND_SPIKE)
-    add_library(deren_vulkan SHARED)
-else()
-    add_library(deren_vulkan STATIC)
-endif()
+add_library(deren_vulkan SHARED)
+target_compile_definitions(deren_vulkan PRIVATE DEREN_API_SHARED DEREN_API_BUILD)
 add_library(deren::vulkan ALIAS deren_vulkan)
 
 if(DEREN_BACKEND_SPIKE)
@@ -386,7 +350,7 @@ if(DEREN_BACKEND_SPIKE)
 endif()
 
 target_sources(deren_vulkan
-    PUBLIC
+    PRIVATE
         FILE_SET CXX_MODULES
         FILES
         vulkan/core/core.cppm
@@ -397,15 +361,15 @@ target_sources(deren_vulkan
         vulkan/core/vma/handles/vma_handles.cppm
         vulkan/core/handles/handles.cppm
         vulkan/core/init_utils/init_utils.cppm
-        vulkan/init_utils/init_utils.cppm
         vulkan/core/pipeline/pipeline.cppm
         vulkan/core/pipeline/spirv_parser.cppm
-        vulkan/constant_init/constant_init.cppm
     PRIVATE
         vulkan/core/core.cpp
         # The RHI contract's virtuals for this backend (plan §11.4, S1-C): `core` derives from
         # `deren::promise::rhi::api_core`, so this is where abilities() and the frame calls live.
         vulkan/core/core.api_core.cpp
+        vulkan/core/core.resources.cpp
+        vulkan/core/core.native_services.cpp
         # The THREE C entry points, DEFINED for the real backend (promise/rhi/backend_entry.hpp,
         # S2). A plain TU rather than a module implementation unit, because an entry point has to be
         # reachable BY NAME from an image that imports no module of this target - the same reason
@@ -413,11 +377,11 @@ target_sources(deren_vulkan
         # symbol nothing calls) and the dllexport half of the boundary under -DDEREN_BACKEND_SPIKE.
         vulkan/core/core.entry.cpp
         vulkan/core/handles/handles.cpp
-        vulkan/init_utils/init_utils.cpp
         vulkan/core/pipeline/pipeline.cpp
         third_party/spirv-reflect/spirv_reflect.c
 )
 target_link_libraries(deren_vulkan
+        PRIVATE
         # The backend implements the contract, so the contract's module is a dependency of THIS target
         # and of nothing else in the backend's direction (promise/rhi/*.cppm imports nothing back).
         promise
@@ -433,6 +397,14 @@ target_include_directories(deren_vulkan
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
+add_library(deren_gpu_constants STATIC)
+target_sources(deren_gpu_constants PUBLIC FILE_SET CXX_MODULES FILES vulkan/constant_init/constant_init.cppm)
+target_link_libraries(deren_gpu_constants PUBLIC Vulkan::Vulkan vstd_lib)
+add_library(deren_backend_host STATIC)
+target_sources(deren_backend_host PUBLIC FILE_SET CXX_MODULES FILES utility/backend_context.cppm
+    PRIVATE utility/backend_platform.cpp)
+target_link_libraries(deren_backend_host PUBLIC utility promise glfw PRIVATE bcrypt)
+target_link_libraries(deren_vulkan PRIVATE deren_gpu_constants)
 add_library(vulkancorekit STATIC)
 
 target_sources(vulkancorekit
@@ -440,6 +412,9 @@ target_sources(vulkancorekit
         FILE_SET CXX_MODULES
         FILES
         vulkan/core/filter/filters.cppm
+        vulkan/engine/engine_gpu.cppm
+        vulkan/engine/engine_device.cppm
+        vulkan/init_utils/init_utils.cppm
         vulkan/math/math.cppm
         vulkan/runtime/runtime.cppm
     vulkan/runtime/runtime.declarations.cppm
@@ -487,6 +462,7 @@ target_sources(vulkancorekit
         vulkan/animation/mmd_motion.cppm
     PRIVATE
         vulkan/core/filter/filters.cpp
+        vulkan/init_utils/init_utils.cpp
         vulkan/math/math.cpp
         vulkan/runtime/runtime.cpp
         vulkan/pass/taa.cpp
@@ -696,9 +672,32 @@ target_include_directories(vulkancorekit
 # The engine side gets the backend's modules (BMIs) and symbols from deren_vulkan. PUBLIC, because a
 # static library's link interface is what carries the module file set to the exe and to the tests
 # (§11.2): vulkancorekit's own name and its outward link surface are unchanged by S1-A.
-target_link_libraries(vulkancorekit PUBLIC deren_vulkan)
+target_link_libraries(vulkancorekit PUBLIC promise deren_backend_host deren_gpu_constants)
 
 add_executable(deren main.cpp)
+if(WIN32)
+    # 每次构建都核对复制，库更新时不要求主程序恰好重新链接。
+    add_custom_target(deren_glfw_runtime ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:deren>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:deren_glfw_shared>" "$<TARGET_FILE_DIR:deren>/glfw3.dll"
+        VERBATIM)
+    add_dependencies(deren deren_glfw_runtime)
+    add_dependencies(deren_vulkan deren_glfw_runtime)
+endif()
+
+option(DEREN_BUILD_WINDOW_PROBE "Build the manual shared-GLFW EXE/DLL check (not a headless CTest)" OFF)
+if(DEREN_BUILD_WINDOW_PROBE)
+    if(NOT WIN32)
+        message(FATAL_ERROR "The shared GLFW window probe currently requires Windows")
+    endif()
+    add_library(probe_shared_glfw_backend SHARED tests/shared_glfw/backend.c)
+    target_compile_definitions(probe_shared_glfw_backend PRIVATE PROBE_BUILD)
+    target_link_libraries(probe_shared_glfw_backend PRIVATE glfw)
+    add_executable(probe_shared_glfw_host tests/shared_glfw/host.c)
+    target_link_libraries(probe_shared_glfw_host PRIVATE probe_shared_glfw_backend glfw)
+    add_dependencies(probe_shared_glfw_host deren_glfw_runtime)
+endif()
 # Release builds link as a Windows GUI-subsystem executable: no console window appears when
 # running. On the MSYS2 clang64 / MinGW-w64 toolchain WIN32_EXECUTABLE maps to -mwindows; the CRT
 # still calls main(), only the subsystem changes. Debug keeps the console for terminal log output.
@@ -771,15 +770,14 @@ target_link_libraries(${PROJECT_NAME}
 # symbol de-duplication) and no isolation where isolation is needed. The exe therefore takes the
 # same default as the DLL: one libc++.dll, one C++ runtime for the whole program.
 #
-# What stays static, deliberately: glfw (named as an archive by the INTERFACE target above, so
-# dropping -static did not turn the exe into a glfw3.dll consumer) and the vendored C libraries
-# (mimalloc, xxhash). Their static archives mean the process still has one operator new/delete
+# GLFW is now shared as well; the Windows build stages glfw3.dll next to the executable.
+# What stays static, deliberately: the vendored C libraries (mimalloc, xxhash).
+# Their static archives mean the process still has one operator new/delete
 # per image - the allocator is NOT unified by this, only the runtime around it is (see
 # deren-ab/rhi/dll_compat_entry_plan.md, "the C++ runtime and the allocator are two questions").
 #
-# WHAT THIS COSTS: the shipped exe now needs libc++.dll beside it or on PATH - the single-file
-# Release build is gone. Measured on MSYS2 clang64: libc++.dll 1659392 B, and it is the ONLY
-# added file (libc++.dll's own imports are KERNEL32 plus the UCRT api-ms-win-crt-* set, and
+# The shipped Windows exe needs both libc++.dll and glfw3.dll in its release bundle.
+# Previous measurements of libc++.dll: 1659392 B (its own imports are KERNEL32 plus the UCRT api-ms-win-crt-* set, and
 # neither image imports libunwind.dll, so that 63488 B copy in the toolchain is not needed).
 # The exe itself got smaller: 3719168 -> 3139072 B.
 #
@@ -1049,7 +1047,7 @@ endif()
 # ---- compile options: one shared flag set on every first-party C++ target (vendored code is
 # deliberately excluded - imgui / fastgltf / simdjson / xxhash / mimalloc do not follow the
 # project's -Werror set, see their own targets above).
-foreach(compile_target IN ITEMS vstd_lib deren deren_vulkan vulkancorekit utility promise gltf_loader app_config chores ${VR_TEST_TARGETS})
+foreach(compile_target IN ITEMS deren_backend_host deren_gpu_constants vstd_lib deren deren_vulkan vulkancorekit utility promise gltf_loader app_config chores ${VR_TEST_TARGETS})
     target_compile_options(${compile_target} PRIVATE ${COMPILE_OPTIONS})
 endforeach()
 # One warning is suppressed for vstd_lib under MSVC, and the reason is the module's job description:
@@ -1509,3 +1507,9 @@ add_custom_command(
 add_custom_target(shaders ALL DEPENDS ${VR_SHADER_OUTPUTS} "${VR_SHADER_OUT_DIR}/.sources-copied")
 add_dependencies(deren shaders)
 message(STATUS "slangc: ${VR_SLANGC_EXECUTABLE} - every build compiles shaders/*.spv into ${VR_SHADER_OUT_DIR}")
+
+# 正式包：宿主只通过绝对路径加载后端，显式导出仅三个C入口。
+set(DEREN_SHADER_COMPILE_CONTRACT -allow-glsl -DVR_SLANG -target spirv -profile spirv_1_6
+    -capability spvDescriptorHeapEXT -spirv-resource-heap-stride 64 -spirv-sampler-heap-stride 32 -fvk-use-gl-layout -matrix-layout-column-major)
+include(cmake/FormalBackendPackage.cmake)
+deren_configure_backend_package(HOST deren BACKEND deren_vulkan LOADER deren_backend_host)

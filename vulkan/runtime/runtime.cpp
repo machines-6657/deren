@@ -22,7 +22,7 @@ import deren.vulkan.render_resource.shared;
 import deren.utility;
 import deren.vulkan.constant_init;
 import deren.vulkan.frame_constants; // one frame's shared constants (see update_frame_constants)
-import deren.vulkan.core.pipeline;   // deren::vulkan::make_pipeline for the post-process pipeline
+import deren.vulkan.engine_gpu;      // deren::vulkan::make_pipeline for the post-process pipeline
 import deren.vulkan.meshlet;         // the meshlet split (docs/mesh_shaders.md step 3): pure CPU, built at upload
 
 // Route std::pmr allocations through mimalloc for this TU (deren.utility:better_pmr). Idempotent:
@@ -55,8 +55,8 @@ namespace deren::vulkan {
             .accelerationStructure = tlas,
         };
         VkDeviceAddress const tlas_address = get_structure_address != nullptr ? get_structure_address(this->vulkan_core.logical_device, &tlas_address_info) : 0;
-        if (!this->vulkan_core.descriptor_heaps.write_buffer(core::heap_slot_offset(core::heap_slots::tlas + frame_slot), tlas_address, this->structures.structure_size(frame_slot), VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)) {
-            deren::utility::log("descriptor heap: the top level structure did not reach grid slot {}", core::heap_slots::tlas + frame_slot);
+        if (!this->vulkan_core.descriptor_heaps.write_buffer(engine_device::heap_slot_offset(engine_device::heap_slots::tlas + frame_slot), tlas_address, this->structures.structure_size(frame_slot), VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)) {
+            deren::utility::log("descriptor heap: the top level structure did not reach grid slot {}", engine_device::heap_slots::tlas + frame_slot);
         }
 
         // ... AND THE INSTANCE TABLE, which is rebuilt WITH the structures and whose slot is the same event's: the
@@ -68,14 +68,14 @@ namespace deren::vulkan {
         // out of the escape - the same path every other converted site takes. The pointer is BORROWED from the
         // structure's own slot (see that accessor's note): it is read here and nothing keeps it.
         if (rhi::buffer const* const instance_table = this->structures.instance_table_buffer(frame_slot); instance_table != nullptr) {
-            if (!this->write_heap_buffer(*instance_table, core::heap_slots::mask_instances + frame_slot, this->structures.instance_table_size(frame_slot), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)) {
-                deren::utility::log("descriptor heap: the instance table did not reach grid slot {}", core::heap_slots::mask_instances + frame_slot);
+            if (!this->write_heap_buffer(*instance_table, engine_device::heap_slots::mask_instances + frame_slot, this->structures.instance_table_size(frame_slot), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)) {
+                deren::utility::log("descriptor heap: the instance table did not reach grid slot {}", engine_device::heap_slots::mask_instances + frame_slot);
             }
         }
     }
 
     void runtime::begin_rendering(VkCommandBuffer const command_buffer, uint32_t const image_index, VkRenderingFlags const flags) const {
-        core const& vk = this->vulkan_core;
+        engine_device const& vk = this->vulkan_core;
 
         // Dynamic rendering (Vulkan 1.3 core, the only path the engine supports): attachments are
         // described inline, no render pass / framebuffer objects exist. The scene instance is always
@@ -127,7 +127,7 @@ namespace deren::vulkan {
     }
 
     frame_status runtime::poll_events() {
-        core& vk = this->vulkan_core;
+        engine_device& vk = this->vulkan_core;
         GLFWwindow* window = vk.window;
 
         // Window events first: respond to ESC / native close before any GPU work
@@ -196,7 +196,7 @@ namespace deren::vulkan {
     }
 
     void runtime::recreate_if_minimized() {
-        core& vk = this->vulkan_core;
+        engine_device& vk = this->vulkan_core;
         if (this->was_minimized) {
             this->was_minimized = false;
             deren::utility::log("window restored, recreating swapchain");
@@ -343,7 +343,7 @@ namespace deren::vulkan {
         }
         // The overlay draws into the runtime's OPEN main rendering instance via dynamic
         // rendering (the backend is initialized with UseDynamicRendering=true).
-        deren::vulkan::core const& vk = this->vulkan_core;
+        deren::vulkan::engine_device const& vk = this->vulkan_core;
         gui::gui_create_info info = {};
         info.window = vk.window;
         info.instance = vk.instance;
@@ -353,7 +353,7 @@ namespace deren::vulkan {
         info.graphics_queue = vk.graphics_queue_handle;
         info.color_format = vk.swap_chain_image_format;
         info.depth_format = VK_FORMAT_UNDEFINED; // the post/gui pass has no depth attachment
-        info.frames_in_flight = static_cast<uint32_t>(deren::vulkan::core::MAX_FRAMES_IN_FLIGHT);
+        info.frames_in_flight = static_cast<uint32_t>(deren::vulkan::engine_device::MAX_FRAMES_IN_FLIGHT);
         return this->debug_overlay.init(info);
     }
 
@@ -386,7 +386,7 @@ namespace deren::vulkan {
         // GPU pipeline creation is expensive and touches no shared registry state: build it
         // OUTSIDE the lock so a reader is never blocked by shader compilation.
         //
-        // BUILT FROM THE DEVICE, not through `core::make_pipeline`: that entry point is the old style - it
+        // BUILT FROM THE DEVICE, not through `engine_device::make_pipeline`: that entry point is the old style - it
         // reached into the core for the flat scene layout, the surface format and the depth format, which is
         // exactly what a caller that is not the runtime (a pass, whose create step has a device and its own
         // layout) cannot do. The four facts are read here instead, and they are the ones that entry point used,
@@ -404,7 +404,7 @@ namespace deren::vulkan {
         //      - the vertex pipeline that used to absorb a refusal does not exist any more.
         std::optional<vk_pipeline> mesh_result = std::nullopt;
         {
-            auto built = deren::vulkan::make_pipeline(this->vulkan_core.logical_device,
+            auto built = deren::vulkan::make_pipeline(this->vulkan_core.gpu,
                                                       std::span<VkFormat const>(color_formats),
                                                       this->vulkan_core.depth_attachment_format,
                                                       mesh_vertex_shader_code,
@@ -433,7 +433,7 @@ namespace deren::vulkan {
             // reads one meshlet per workgroup out of the heap table and culls it against the camera. Built exactly
             // like the mesh form - it IS a mesh stage - and a refusal leaves the mesh form as the answer, which is
             // why this is a third entry rather than a replacement.
-            auto built = deren::vulkan::make_pipeline(this->vulkan_core.logical_device,
+            auto built = deren::vulkan::make_pipeline(this->vulkan_core.gpu,
                                                       std::span<VkFormat const>(color_formats),
                                                       this->vulkan_core.depth_attachment_format,
                                                       meshlet_shader_code,
@@ -682,7 +682,7 @@ namespace deren::vulkan {
         // EVERY FIELD IS THE RENDERER'S OWN (see the struct's docs): its pipelines, its frame's content, the device,
         // the knobs that its own policy also reads. What a PASS answers about itself is deliberately absent - the
         // owner of the passes asks them.
-        core const& vk = this->vulkan_core;
+        engine_device const& vk = this->vulkan_core;
         return feature_facts{
             .gbuffer_pass = this->gbuffer_pass_active(),
             .deferred_lit = this->deferred_lit_active(),
@@ -1173,7 +1173,7 @@ namespace deren::vulkan {
         /// Push @p bytes and then @p lanes index lanes (see runtime::push_stage_block). The three endpoints differ
         /// only in that count, because a stage's shader declares exactly as many lanes as it reads: the post chain
         /// three (its source slot included), everything else two, the mask bake none.
-        bool push_with_lanes(core const& vk, uint32_t const frame_slot, uint32_t const image_index, VkCommandBuffer const command_buffer,
+        bool push_with_lanes(engine_device const& vk, uint32_t const frame_slot, uint32_t const image_index, VkCommandBuffer const command_buffer,
                              std::span<std::byte const> const bytes, uint32_t const extra_lane, std::size_t const lanes) {
             constexpr std::size_t window = 256; // maxPushDataSize on this device (see heap_limits)
             std::array<std::byte, window> staging = {};
@@ -1204,8 +1204,8 @@ namespace deren::vulkan {
         // and the per-level stride is heap_image_capacity, the same 8 slots every per-swapchain-image array is
         // spaced by.
         uint32_t const source_slot = extra_lane == 0u
-                                         ? core::heap_slots::post_color + self->current_image_index
-                                         : core::heap_slots::bloom_l0 + (extra_lane - 1u) * core::heap_image_capacity + self->current_image_index;
+                                         ? engine_device::heap_slots::post_color + self->current_image_index
+                                         : engine_device::heap_slots::bloom_l0 + (extra_lane - 1u) * engine_device::heap_image_capacity + self->current_image_index;
         return push_with_lanes(self->vulkan_core, static_cast<uint32_t>(self->vulkan_core.current_frame), self->current_image_index, command_buffer, bytes, source_slot, 3u);
     }
 
@@ -1244,7 +1244,7 @@ namespace deren::vulkan {
 
     bool runtime::draw_mesh_tasks(void* const owner, VkCommandBuffer const command_buffer, uint32_t const groups_x, uint32_t const groups_y, uint32_t const groups_z) {
         runtime* const self = static_cast<runtime*>(owner);
-        core const& vk = self->vulkan_core;
+        engine_device const& vk = self->vulkan_core;
         if (vk.mesh_dispatch == nullptr) {
             // Unreachable while the mesh path is gated on the capability (see runtime::create_passes), and answered
             // rather than asserted: a dispatch that cannot be recorded draws NOTHING, which is the same picture a
@@ -1266,7 +1266,7 @@ namespace deren::vulkan {
     // buffer never bound) went unnoticed for a whole round.
     bool runtime::draw_mesh_tasks_indirect(void* const owner, VkCommandBuffer const command_buffer, uint32_t const command_slot, uint32_t const groups_x, uint32_t const groups_y, uint32_t const groups_z) {
         runtime* const self = static_cast<runtime*>(owner);
-        core const& vk = self->vulkan_core;
+        engine_device const& vk = self->vulkan_core;
         auto const direct = [&]() {
             self->mesh_indirect_direct_fallbacks.fetch_add(1u, std::memory_order_relaxed);
             return runtime::draw_mesh_tasks(owner, command_buffer, groups_x, groups_y, groups_z);
@@ -1402,7 +1402,7 @@ namespace deren::vulkan {
 
     void runtime::set_toon_rig(toon_rig const& rig) noexcept {
         // A PLAIN COPY INTO THE MAPPED BLOCK, and it is safe for the reason every other once-written table here
-        // is (see core::heap_slots::toon_rig): the frame path never rewrites this block, so there is no frame in
+        // is (see engine_device::heap_slots::toon_rig): the frame path never rewrites this block, so there is no frame in
         // flight that could read it half-written. The contract that follows from that is the caller's - write it
         // BEFORE the frame loop, not from inside a frame.
         if (this->toon_rig_mapped != nullptr) {
@@ -1738,7 +1738,7 @@ namespace deren::vulkan {
         result->overlay_kind = info.overlay_kind;
         // ... AND THIS LEAF'S OUTLINE WIDTH, for the same list-building reason: the frame has to know which
         // leaves the ① outline group draws BEFORE any draw is recorded, and the material's `_OutlineWidth` is
-        // otherwise only in the GPU colour-lane table (`core::heap_slots::toon_colours`) where the frame cannot
+        // otherwise only in the GPU colour-lane table (`engine_device::heap_slots::toon_colours`) where the frame cannot
         // read it. Read out of the SAME `toon_inputs` the shader's lane is built from, so the gate the frame
         // applies and the gate the outline mesh stage applies (`w > 0`) cannot disagree.
         result->outline_width = info.toon.colours[static_cast<std::size_t>(toon_colour_lane::outline_edge)].w;
@@ -1793,7 +1793,7 @@ namespace deren::vulkan {
         uint32_t const motion_base = this->motion_cursor;
         uint32_t const motion_count = std::min<uint32_t>(count, deren::vulkan::scene_motion_capacity - this->motion_cursor);
         this->motion_cursor += motion_count;
-        for (int32_t slot = 0; slot < deren::vulkan::core::MAX_FRAMES_IN_FLIGHT; ++slot) {
+        for (int32_t slot = 0; slot < deren::vulkan::engine_device::MAX_FRAMES_IN_FLIGHT; ++slot) {
             auto* const published = static_cast<glm::mat4*>(this->motion_mapped[static_cast<std::size_t>(slot)]);
             if (published != nullptr && motion_count > 0) {
                 std::memcpy(published + motion_base, transforms.data(), static_cast<std::size_t>(motion_count) * sizeof(glm::mat4));

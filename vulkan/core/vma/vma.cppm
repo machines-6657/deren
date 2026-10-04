@@ -241,6 +241,14 @@ namespace deren::vulkan {
         [[nodiscard]] std::pair<VkCommandPool, VkCommandBuffer> create_command_pair() const;
 
     public:
+        // 后端帧、读回和上传必须使用同一队列锁；该引用不进入 RHI 契约。
+        [[nodiscard]] std::mutex& queue_sync() noexcept {
+            return this->queue_mutex;
+        }
+        [[nodiscard]] bool ready() const noexcept {
+            return this->allocator != nullptr;
+        }
+
         /**
          * @ingroup vulkan_vma
          * @brief initialize the VMA allocator with the given vulkan objects
@@ -666,12 +674,23 @@ namespace deren::vulkan {
         // without it could not run the 1.3 paths this engine requires anyway.
         vma_allocator_create_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
 
-        vmaCreateAllocator(&vma_allocator_create_info, &this->allocator);
+        VkResult const created = vmaCreateAllocator(&vma_allocator_create_info, &this->allocator);
+        if (created != VK_SUCCESS) {
+            deren::utility::error("VMA allocator creation failed: VkResult {}", static_cast<int>(created));
+            this->allocator = VK_NULL_HANDLE;
+            return;
+        }
 
         this->logical_device = device;
         this->upload_queue = queue;
         this->upload_queue_family_index = queue_family_index;
-        this->command_cache.push_back(this->create_command_pair());
+        auto const command_pair = this->create_command_pair();
+        if (command_pair.first == VK_NULL_HANDLE || command_pair.second == VK_NULL_HANDLE) {
+            vmaDestroyAllocator(this->allocator);
+            this->allocator = VK_NULL_HANDLE;
+            return;
+        }
+        this->command_cache.push_back(command_pair);
     }
 
     bool vma_allocator::is_host_coherent(uint32_t const memory_type_index) const noexcept {
@@ -1357,15 +1376,18 @@ namespace deren::vulkan {
     std::pair<VkCommandPool, VkCommandBuffer> vma_allocator::create_command_pair() const {
         VkCommandPoolCreateInfo command_pool_create_info = make_command_pool_info(this->upload_queue_family_index);
 
-        VkCommandPool command_pool;
+        VkCommandPool command_pool = VK_NULL_HANDLE;
         if (vkCreateCommandPool(this->logical_device, &command_pool_create_info, nullptr, &command_pool) != VK_SUCCESS) {
-            deren::utility::panic("Failed to create command pool");
+            deren::utility::error("VMA upload command pool creation failed");
+            return {};
         }
 
-        VkCommandBuffer command_buffer;
+        VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         VkCommandBufferAllocateInfo buffer_allocate_info = make_command_buffer_allocate_info(command_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
         if (vkAllocateCommandBuffers(this->logical_device, &buffer_allocate_info, &command_buffer) != VK_SUCCESS) {
-            deren::utility::panic("Failed to create command buffer");
+            deren::utility::error("VMA upload command buffer allocation failed");
+            vkDestroyCommandPool(this->logical_device, command_pool, nullptr);
+            return {};
         }
         return {command_pool, command_buffer};
     }

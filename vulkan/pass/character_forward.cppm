@@ -22,7 +22,7 @@
  * WHAT IT OWNS: the two targets entered with LOAD, the two barriers that hand the depth between
  * "sampled" and "attachment" layouts (it is what takes it out of SHADER_READ and what puts it back), and
  * the raster state the stage needs - depth compare EQUAL comes from the PIPELINE
- * (`core::make_character_forward_pipeline`); depth WRITE off is a dynamic state this pass records and
+ * (`engine_device::make_character_forward_pipeline`); depth WRITE off is a dynamic state this pass records and
  * then LOCKS, because every leaf's draw() otherwise turns it back on (see
  * render_environment::depth_write_locked).
  *
@@ -72,7 +72,7 @@ export namespace deren::vulkan::pass {
          * once: a different pipeline (the multiply one, see `overlay_pipeline_name`), AFTER every toon leaf
          * rather than in scene order, and for the hair shadow's mask by geometry alone - this renderer has no
          * stencil attachment for the article's `Stencil { Ref 1 Comp Equal }` to test, which is a recorded
-         * difference rather than an oversight (see `core::make_overlay_pipeline`).
+         * difference rather than an oversight (see `engine_device::make_overlay_pipeline`).
          */
         std::span<primitive const* const> overlay_leaves = {};
         /**

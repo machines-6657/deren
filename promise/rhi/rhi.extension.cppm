@@ -67,6 +67,12 @@ export namespace deren::promise::rhi {
     struct buffer;
     struct command_list;
     struct image;
+    struct image_view;
+    struct sampler;
+    struct shader;
+    struct pipeline;
+    struct query;
+    struct swapchain;
 
     // Descriptor shapes that are still S1 design surface (§5's capability table and
     // §6.4's usage/barrier decisions). A reference to an incomplete type is all a
@@ -231,7 +237,117 @@ export namespace deren::promise::rhi {
     /// Vulkan backend that did not announce this bit would make the engine fail at startup by name.
     /// Once the passes record through the contract, the escape shrinks to the few calls the contract has
     /// no concept for.
+    // Vulkan-only device services. Their payloads are non-owning, fixed-layout values;
+    // no allocator, renderer target family, or pipeline recipe crosses this surface.
+    enum class vulkan_service : std::uint32_t {
+        snapshot,
+        wait_slot,
+        acquire,
+        submit,
+        present,
+        advance,
+        recreate,
+        frame_command,
+        swapchain_image,
+        create_pool,
+        allocate_command,
+        free_command,
+        reset_pool,
+        begin_timing,
+        mark_timing,
+        read_timing,
+        heap_write_buffer,
+        heap_write_image,
+        heap_write_samplers,
+        heap_bind,
+        heap_push,
+        heap_bind_infos,
+        submit_and_wait,
+        wait_idle
+    };
+    struct vulkan_blob {
+        void* data = nullptr;
+        std::uint32_t size = 0;
+    };
+    struct vulkan_heap_limits {
+        std::uint64_t max_resource_size = 0, max_sampler_size = 0;
+        std::uint64_t resource_alignment = 0, sampler_alignment = 0;
+        std::uint64_t resource_reserved = 0, sampler_reserved_with_embedded = 0;
+        std::uint32_t buffer_descriptor_size = 0, image_descriptor_size = 0, sampler_descriptor_size = 0;
+        std::uint32_t max_push_data = 0, max_embedded_samplers = 0;
+    };
+    struct vulkan_snapshot {
+        void* instance = nullptr;
+        void* physical_device = nullptr;
+        void* device = nullptr;
+        void* graphics_queue = nullptr;
+        std::uint32_t queue_family = 0, present_queue_family = 0;
+        std::uint32_t frame_count = 0, current_frame = 0, image_count = 0, sample_count = 1;
+        std::uint32_t format = 0, depth_format = 0, width = 0, height = 0;
+        std::uint32_t render_width = 0, render_height = 0;
+        float render_scale = 1.0f;
+        std::uint32_t mesh_shader = 0, ray_query = 0, ray_tracing = 0, opacity_micromap = 0;
+        std::uint32_t host_image_copy = 0, gpu_timing = 0, heap_ready = 0;
+        std::uint64_t heap_grid_offset = ~std::uint64_t{0}, heap_resource_size = 0;
+        vulkan_heap_limits heap = {};
+        // Optional caller-owned VkPhysicalDeviceProperties / RayTracingPipelinePropertiesKHR /
+        // AccelerationStructurePropertiesKHR destinations. Exact byte sizes are checked.
+        vulkan_blob device_properties = {}, ray_tracing_properties = {}, acceleration_properties = {};
+    };
+    struct vulkan_frame {
+        std::uint32_t slot = 0, image_index = 0;
+        void* command_buffer = nullptr;
+        std::uint64_t image = 0, image_view = 0; // swapchain-owned; invalid after recreation
+        std::int32_t result = 0;                 // VkResult; preserves OUT_OF_DATE and SUBOPTIMAL distinctly.
+        std::uint32_t recreated = 0;
+    };
+    struct vulkan_command {
+        std::uint64_t pool = 0;
+        void* command_buffer = nullptr;
+        std::uint32_t secondary = 0;
+        std::int32_t result = 0;
+    };
+    inline constexpr std::uint32_t vulkan_timing_capacity = 16;
+    struct vulkan_timing {
+        void* command_buffer = nullptr;
+        std::uint32_t slot = 0, stage = 0, mark_count = 0, written_marks = 0;
+        std::array<double, vulkan_timing_capacity> milliseconds = {};
+    };
+    struct vulkan_heap_buffer {
+        std::uint64_t offset = 0, address = 0, size = 0;
+        std::uint32_t type = 0;
+        std::uint32_t accepted = 0;
+    };
+    struct vulkan_heap_image {
+        std::uint64_t offset = 0;
+        vulkan_blob view = {}; // VkImageViewCreateInfo
+        std::uint32_t layout = 0, type = 0, accepted = 0;
+    };
+    struct vulkan_heap_samplers {
+        std::uint64_t offset = 0;
+        vulkan_blob infos = {}; // count contiguous VkSamplerCreateInfo values
+        std::uint32_t count = 0, accepted = 0;
+    };
+    struct vulkan_heap_commands {
+        void* command_buffer = nullptr;
+        std::uint32_t offset = 0, accepted = 0;
+        void const* data = nullptr;
+        std::uint32_t data_size = 0;
+        vulkan_blob resource_bind = {}, sampler_bind = {}; // VkBindHeapInfoEXT
+    };
+    struct vulkan_submit_wait {
+        void* command_buffer = nullptr;
+        std::uint64_t timeout_nanoseconds = ~std::uint64_t{0};
+        std::int32_t result = 0;
+    };
+
     struct vulkan_escape : extension {
+        /// payload_size must exactly match the operation's named POD. Frame operations return
+        /// transport success here and the original VkResult in vulkan_frame::result.
+        /// Pools belong to the backend root. The caller owns allocated commands and frees them
+        /// before releasing that root; frame commands and swapchain images are borrowed.
+        [[nodiscard]] virtual error service(vulkan_service operation, void* payload,
+                                            std::uint32_t payload_size) noexcept = 0;
         /// VkInstance / VkPhysicalDevice / VkDevice / VkQueue as their own types. All four are
         /// DISPATCHABLE handles (pointers), so `void*` carries them without naming a Vulkan type in the
         /// contract. Null before the device exists; the context's lifetime covers them.
@@ -275,6 +391,14 @@ export namespace deren::promise::rhi {
         /// `device_address::buffer_address()` answers the addressable case; this is the escape hatch for
         /// the rest, and it is why the engine can stop reaching for the allocator's detail map.
         [[nodiscard]] virtual void* native_buffer(buffer const& resource) const noexcept = 0;
+        // Borrowed native handles; null for a resource belonging to another context.
+        [[nodiscard]] virtual void* native_image(image const& resource) const noexcept = 0;
+        [[nodiscard]] virtual void* native_image_view(image_view const& resource) const noexcept = 0;
+        [[nodiscard]] virtual void* native_sampler(sampler const& resource) const noexcept = 0;
+        [[nodiscard]] virtual void* native_shader(shader const& resource) const noexcept = 0;
+        [[nodiscard]] virtual void* native_pipeline(pipeline const& resource) const noexcept = 0;
+        [[nodiscard]] virtual void* native_query(query const& resource) const noexcept = 0;
+        [[nodiscard]] virtual void* native_swapchain(swapchain const& resource) const noexcept = 0;
     };
 
 } // namespace deren::promise::rhi

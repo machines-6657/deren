@@ -59,7 +59,7 @@ import deren.vulkan.ray_tracing;            // THE STRUCTURE PHASE: the structur
 import deren.vulkan.init_utils;             // the resource-creation patterns the init functions below repeat
 import deren.promise.rhi;                   // the creation contract (create_info): the type the constructor below takes
 export import deren.vstd;
-export import deren.vulkan.core;
+export import deren.vulkan.engine_device;
 export import deren.vulkan.core.filters;
 export import deren.vulkan.scene_tree;         // scene storage + the abstract leaf interface (pure CPU)
 export import deren.vulkan.primitive;          // the GPU primitives + material/UBO records (peer module)
@@ -75,7 +75,7 @@ namespace rhi = deren::promise::rhi;
 /**
  * @file runtime.cppm
  * @defgroup vulkan_runtime Vulkan Runtime Facade
- * @brief runtime facade: a thin wrapper exposing all functionality of deren::vulkan::core
+ * @brief runtime facade: a thin wrapper exposing all functionality of deren::vulkan::engine_device
  * @note
  *      - use operator-> to access the filtered core view (core_filter, e.g. runtime->get_device())
  *      - the inner core's lifetime is tied to the runtime
@@ -172,9 +172,9 @@ namespace deren::vulkan {
          * reference-counted root states it instead, and the device may now outlive this runtime when the caller
          * kept its own reference - which is the point of sharing it.
          */
-        std::shared_ptr<core> core_owner;
+        std::shared_ptr<engine_device> core_owner;
         /// the alias every method and member keeps using: it IS `*core_owner`, and owns nothing of its own
-        core& vulkan_core;
+        engine_device& vulkan_core;
 
         /**
          * @ingroup vulkan_runtime
@@ -196,7 +196,7 @@ namespace deren::vulkan {
         // set while the window is iconified; the restore transition recreates the swapchain
         bool was_minimized = false;
 
-        // ---- shared scene resources (the heap's per-frame-slot slots; see core::heap_slots) ----
+        // ---- shared scene resources (the heap's per-frame-slot slots; see engine_device::heap_slots) ----
         //
         // EVERY BUFFER BELOW IS A CONTRACT `object_manager` NOW, AND ITS RELEASE ORDER IS THE ONE FACT
         // THIS SECTION RELIES ON: a manager's destructor calls `buffer::release()`, which runs INSIDE the
@@ -250,16 +250,16 @@ namespace deren::vulkan {
         void* material_mapped = nullptr;
         // THE TOON LANES BESIDE THE RECORD: ONE `uvec4` PER MATERIAL (x = `_SDFLightmap`, y =
         // `_MetallicGlossMap`, z and w reserved), and a buffer of its own because the material record cannot
-        // carry a fifth lane - it is inline in the per-draw push block (see core::heap_slots::toon_lanes).
+        // carry a fifth lane - it is inline in the per-draw push block (see engine_device::heap_slots::toon_lanes).
         // Host-visible and written once at import, exactly like the table above and for the same reason.
         rhi::object_manager<rhi::buffer> toon_lane_buffer = {};
         void* toon_lane_mapped = nullptr;
-        // THE TOON LIGHT RIG: one block for the whole run (see core::heap_slots::toon_rig), written by
+        // THE TOON LIGHT RIG: one block for the whole run (see engine_device::heap_slots::toon_rig), written by
         // `set_toon_rig` - which the application calls from its config, before the first frame. Host-visible and
         // never rewritten by the frame path, exactly like the lane table above.
         rhi::object_manager<rhi::buffer> toon_rig_buffer = {};
         void* toon_rig_mapped = nullptr;
-        // THE MATERIAL COLOURS (see `core::heap_slots::toon_colours`): one `vec4` per lane per material, filled
+        // THE MATERIAL COLOURS (see `engine_device::heap_slots::toon_colours`): one `vec4` per lane per material, filled
         // from the sidecar at registration and never rewritten afterwards - the same once-written contract the two
         // tables above follow.
         rhi::object_manager<rhi::buffer> toon_colour_buffer = {};
@@ -274,13 +274,13 @@ namespace deren::vulkan {
         // in init_scene_resources) with a one-time log instead of a hard panic.
         //
         // THE KEY CARRIES THE LANE BLOCK PAST THE RECORD, and it has to: those lanes live OUTSIDE the record
-        // (see core::heap_slots::toon_lanes for why), so a key built from the record alone cannot tell two
+        // (see engine_device::heap_slots::toon_lanes for why), so a key built from the record alone cannot tell two
         // materials apart when they differ ONLY in their SDF or metallic/gloss map - the second would take the
         // dedup early return, never write its lanes, and that material would silently lose the feature. See
         // register_material.
         //
         // ... AND IT CARRIES THE COLOUR LANES FOR EXACTLY THE SAME REASON, one table further along: those six
-        // `vec4`s live outside the record too (see core::heap_slots::toon_colours), and the write that fills
+        // `vec4`s live outside the record too (see engine_device::heap_slots::toon_colours), and the write that fills
         // them sits AFTER this map's early return. A key without them made the write unreachable for the second
         // of two record-identical materials, so that material read the FIRST registrant's six lanes - which is
         // not a missing feature but a WRONG VALUE, and it now governs `_Specular` (lane 4), `_ParallaxScale`
@@ -348,7 +348,7 @@ namespace deren::vulkan {
         std::vector<void*> morph_mapped = {};
         // per-slot scene resources: ONE buffer per frame slot, like the camera UBO - each slot's shader reads
         // its own, so a frame being rendered never shares the buffer the next frame rewrites. The shaders reach
-        // them through the descriptor heap's per-slot grid slots (see core::heap_slots).
+        // them through the descriptor heap's per-slot grid slots (see engine_device::heap_slots).
         // the frame slot paced by the last successful pace_and_acquire();
         // per-frame host writes (set_skin_matrices / morph_scratch) target this slot's buffers
         uint32_t active_slot = 0;
@@ -416,7 +416,7 @@ namespace deren::vulkan {
             {"tail", false},
         }};
         // whether to collect pass timings at all ([render] gpu_timings); the device must be able
-        // to timestamp as well, which core::gpu_timing_available() reports
+        // to timestamp as well, which engine_device::gpu_timing_available() reports
         bool gpu_timings_enabled = true;
         // rolling window of measured intervals: every GPU_TIMING_WINDOW frames the collected
         // samples are averaged, logged, and the window starts over (the GUI label reads the
@@ -441,7 +441,7 @@ namespace deren::vulkan {
         // M1: the opaque pass writes the G-buffer (three surface targets + the HDR target it adds
         // emissive into) instead of shading; M2 adds the deferred lighting stage that reads it back.
         // The G-buffer pipeline shades nothing: albedo/metallic, normal/roughness and material
-        // id/AO/flags go into core::gbuffer_* (1x targets + the pass's own 1x depth), so the opaque
+        // id/AO/flags go into engine_device::gbuffer_* (1x targets + the pass's own 1x depth), so the opaque
         // pass runs at 1x.
         std::optional<vk_pipeline> gbuffer_pipeline = std::nullopt;
         /// ... and the MESH form of the same pass (docs/mesh_shaders.md step 2), when the device can run one and the
@@ -501,7 +501,7 @@ namespace deren::vulkan {
         // THE OWNERSHIP RULE, and it is the reason this class holds no pass at all: a renderer that declares one
         // member per pass decides when every pass is built and destroyed. That question - who owns whom - is
         // answered in exactly one place in this branch: the device root is the `shared_ptr<core>`, and every other
-        // holder holds a VIEW (`pass_filter`, `core::user_filter`, a chain's pass list). The passes were the last
+        // holder holds a VIEW (`pass_filter`, `engine_device::user_filter`, a chain's pass list). The passes were the last
         // exception, and the chain the APPLICATION builds is what removes it: that chain OWNS them (`emplace`), it
         // decides the order they are built and destroyed in, and this class keeps no reference to any of them - its
         // twelve stage arrays hold `frame_pass*` found BY DECLARATION NAME, which is the whole tie.
@@ -624,7 +624,7 @@ namespace deren::vulkan {
         // TAA is the engine's anti-aliasing: the projection is jittered per frame (a Halton
         // sequence), the G-buffer writes motion vectors, and a resolve pass blends the current frame
         // with a reprojected, neighborhood-clamped history. The deferred scene writes
-        // core::scene_color and the resolve writes the HDR target, so the whole post chain keeps
+        // engine_device::scene_color and the resolve writes the HDR target, so the whole post chain keeps
         // reading exactly what it read before TAA existed. A copy of the resolved frame becomes the
         // next frame's history (no ping-pong, hence no per-frame descriptor rewrites).
         // The TAA resolve is a PASS (deren.vulkan.pass.taa): it owns its pipeline and its per-image history flags, so
@@ -1049,7 +1049,7 @@ namespace deren::vulkan {
         // S2 BATCH 2: WHAT IS LEFT HERE IS ABOUT THE FRAME, NOTHING ABOUT THE BUFFER. The staging pointer
         // and the record-time extent used to live here because the recorded copy wrote into a buffer this
         // runtime owned; the copy is now recorded through the contract's recording surface and the bytes
-        // are read from the BACKEND's slot (core::frame_readback_buffer()), so the frame's own state is
+        // are read from the BACKEND's slot (engine_device::frame_readback_buffer()), so the frame's own state is
         // the one-shot flags above and nothing else.
         bool shadows_enabled = false; // true after enable_shadows() (light UBO filled + pipeline ready)
         // live-tunable depth bias of the shadow pass (dynamic state, set per frame before the
@@ -1086,8 +1086,8 @@ namespace deren::vulkan {
         // an animated/deformed/programmatic scene changes it (the fit cache does NOT, which is exactly
         // the trap the animated-Fox test caught), while a static scene repeats it.
         uint32_t shadow_content_version = 1;
-        std::array<uint32_t, deren::vulkan::core::MAX_FRAMES_IN_FLIGHT> shadow_rendered_version = {};
-        std::array<uint64_t, deren::vulkan::core::MAX_FRAMES_IN_FLIGHT> shadow_rendered_models = {};
+        std::array<uint32_t, deren::vulkan::engine_device::MAX_FRAMES_IN_FLIGHT> shadow_rendered_version = {};
+        std::array<uint64_t, deren::vulkan::engine_device::MAX_FRAMES_IN_FLIGHT> shadow_rendered_models = {};
         // The other half of geometry changed: a SKINNED caster keeps a constant push.model, its
         // pose lives entirely in the joint matrices the vertex shader reads, so those are hashed at
         // upload instead (set_skin_matrices). Morph targets have no upload hook at all - the caller
@@ -1321,7 +1321,7 @@ namespace deren::vulkan {
 
         // ---- ray-traced shadows (see [render] rt_shadows / set_rt_shadows) ----
         // The flag is the CONFIG's wish; whether anything can be built from it also depends on the
-        // device (core::ray_query_available), and the two are kept apart on purpose: a device without
+        // device (engine_device::ray_query_available), and the two are kept apart on purpose: a device without
         // ray queries must run the cascaded maps exactly as before, silently, rather than fail or log
         // once per frame.
         bool rt_shadows = false;
@@ -1365,7 +1365,7 @@ namespace deren::vulkan {
         std::size_t meshlet_primitives = 0;
         /// THE TABLE ITSELF: `meshlet_capacity` records of `sizeof(deren::vulkan::meshlet)`, host-visible, appended to
         /// while the scene imports and read by a task stage through the heap (one slot, written once - see
-        /// core::heap_slots::meshlets). `meshlet_total` IS the append cursor.
+        /// engine_device::heap_slots::meshlets). `meshlet_total` IS the append cursor.
         rhi::object_manager<rhi::buffer> meshlet_buffer = {};
         void* meshlet_mapped = nullptr;
         /// one log line for the overflow path, so a scene past the capacity says so once rather than per primitive
@@ -1419,7 +1419,7 @@ namespace deren::vulkan {
          *        to one per workgroup, the host reads the buffer back once at shutdown and logs the totals
          *
          * `MAX_FRAMES_IN_FLIGHT` lanes of `mesh_stat_stride` (8) uints, on the heap at
-         * `core::heap_slots::meshlet_stats` - the only way a mesh stage can reach memory. Host-visible and coherent
+         * `engine_device::heap_slots::meshlet_stats` - the only way a mesh stage can reach memory. Host-visible and coherent
          * because the read-back is a plain mapped read after `wait_idle`, and the counters are cumulative for the
          * whole session: the numbers the doc quotes are totals over a fixed scenario, which is what makes them
          * comparable between runs (the gate's scenarios are 40 frames each).
@@ -2064,7 +2064,8 @@ namespace deren::vulkan {
          *       readback staging buffer) are still created and destroyed by this runtime, in that order - the
          *       shared root only changes WHO owns the device, not who owns those
          */
-        explicit runtime(std::shared_ptr<core> shared_core);
+        explicit runtime(std::shared_ptr<engine_device> shared_core);
+        explicit runtime(deren::utility::backend_token token, GLFWwindow* window);
 
         /**
          * @ingroup vulkan_runtime
@@ -2458,7 +2459,7 @@ namespace deren::vulkan {
          * A SEPARATE ENTRY POINT FROM make_pipeline rather than an overload of it, because that one builds
          * the FORWARD FAMILY's pipeline - the swapchain format, src-alpha blending, depth LESS_OR_EQUAL -
          * which is right for a leaf that shades straight into the display target and wrong for this stage in
-         * all three. This one goes through `core::make_character_forward_pipeline`: ONE HDR target, blending
+         * all three. This one goes through `engine_device::make_character_forward_pipeline`: ONE HDR target, blending
          * OFF, depth compare EQUAL (see that builder for why each of the three is forced rather than chosen).
          *
          * The result lands in the SAME two registries (`mesh_pipelines` / `meshlet_pipelines`) under the same
@@ -2483,7 +2484,7 @@ namespace deren::vulkan {
          * forward family's (swapchain format, src-alpha blending, depth LESS_OR_EQUAL),
          * `make_character_forward_pipeline` the toon stage's (HDR target, blending off, depth EQUAL), and this
          * one the article's two masks' (HDR target, `dst = src * dst`, depth LESS_OR_EQUAL). It goes through
-         * `core::make_overlay_pipeline`, which states why each of those is forced - including why the depth
+         * `engine_device::make_overlay_pipeline`, which states why each of those is forced - including why the depth
          * compare cannot be the toon stage's `EQUAL`.
          *
          * It lands in the same two registries and, like the toon pipeline, never becomes the implicit default.
@@ -2512,7 +2513,7 @@ namespace deren::vulkan {
          * forward family's (swapchain format, src-alpha blending, depth LESS_OR_EQUAL), `make_character_forward_pipeline`
          * the toon stage's (HDR target, blending off, depth EQUAL), `make_overlay_pipeline` the article's two
          * masks' (HDR target, `dst = src * dst`, depth LESS_OR_EQUAL), and this one the ① 描边 hull's (HDR
-         * target, opaque blend, depth LESS_OR_EQUAL). It goes through `core::make_outline_pipeline`, which
+         * target, opaque blend, depth LESS_OR_EQUAL). It goes through `engine_device::make_outline_pipeline`, which
          * states why each of those is what it is.
          *
          * IT LANDS IN THE SAME TWO REGISTRIES AND, LIKE THE OTHER TWO FAMILY PIPELINES, NEVER BECOMES THE
@@ -2708,7 +2709,7 @@ namespace deren::vulkan {
          * @ingroup vulkan_runtime
          * @brief ask for ray-traced sun shadows ([render] rt_shadows)
          * @param enabled true = shadows are traced against the scene's acceleration structures
-         * @note the request is granted only on a device with ray queries (core::ray_query_available);
+         * @note the request is granted only on a device with ray queries (engine_device::ray_query_available);
          *       everywhere else, and while the flag is false, the cascaded shadow maps are what the
          *       shading stages sample and nothing about the frame changes
          * @note the structures themselves are built by the first frame that records with the flag on,
@@ -2797,7 +2798,7 @@ namespace deren::vulkan {
          * @brief publish the toon stage's LIGHT RIG (the sun/head-light split and the chain's global scalars)
          *
          * The character stage's global numbers are one block rather than fields of every material record - see
-         * `deren::vulkan::toon_rig` for what belongs there and `core::heap_slots::toon_rig` for why it is safe to write
+         * `deren::vulkan::toon_rig` for what belongs there and `engine_device::heap_slots::toon_rig` for why it is safe to write
          * outside the frame path: nothing rewrites it while a frame is in flight, so a call from the import path
          * or from a settings change cannot be read half-written. It MEANS the call must be made BEFORE the frame
          * loop starts (or between frames), which is what the application does.
@@ -2925,7 +2926,7 @@ namespace deren::vulkan {
          *        logged and exposed through gpu_timing_summary(); when false no timestamp is
          *        written and nothing is read back
          * @note the switch only matters on devices that can timestamp at all
-         *       (core::gpu_timing_available()); the marks themselves are a handful of
+         *       (engine_device::gpu_timing_available()); the marks themselves are a handful of
          *       vkCmdWriteTimestamp calls per frame, so the cost of leaving it on is negligible -
          *       this exists for a measurement-free profile run
          */
@@ -3078,7 +3079,7 @@ namespace deren::vulkan {
          *
          * THE ARTICLE'S TWO FRAMEBUFFER MULTIPLIES - the eye shadow and the hair shadow - draw with this one
          * pipeline, and the state that makes them overlays rather than surfaces is the pipeline's:
-         * `dst = src * dst` (see `core::make_overlay_pipeline`), with the depth test on so each mask lands only
+         * `dst = src * dst` (see `engine_device::make_overlay_pipeline`), with the depth test on so each mask lands only
          * on the geometry it was authored over. Registering it by NAME rather than keeping it as the pass's own
          * object follows `character_forward_pipeline_name` exactly, and for the same reason: the pass is handed
          * the name (it does not own a registry) and the session's bind callback resolves it.
@@ -3091,7 +3092,7 @@ namespace deren::vulkan {
          *
          * THE ARTICLE'S ① 描边 - `MyZmdOutlineShader` - draws with this one pipeline, and the state that makes a
          * hull an outline rather than a surface is the pipeline's: FRONT faces culled (so only the pushed-out
-         * back shell survives), depth compare LESS_OR_EQUAL and no blend (see `core::make_outline_pipeline`).
+         * back shell survives), depth compare LESS_OR_EQUAL and no blend (see `engine_device::make_outline_pipeline`).
          * Registering it by NAME rather than keeping it as the pass's own object follows
          * `overlay_pipeline_name` exactly, and for the same reason: the pass is handed the name (it does not own
          * a registry) and the session's bind callback resolves it. An empty name means "draw no outline" - the
@@ -3108,7 +3109,7 @@ namespace deren::vulkan {
          * pass, a second stage, a second target) would have made "the new chain" and "a different frame" the same
          * experiment, and the rewrite's own acceptance is a single-variable A/B.
          *
-         * IT IS REGISTERED THROUGH `make_character_forward_pipeline`, WHICH IS WHY NO `core::make_goo_toon_*`
+         * IT IS REGISTERED THROUGH `make_character_forward_pipeline`, WHICH IS WHY NO `engine_device::make_goo_toon_*`
          * EXISTS: that builder's three forced states (ONE HDR target, blending off, depth compare EQUAL, plus the
          * render-extent viewport) are exactly this stage's, so a second core entry point would be a byte-for-byte
          * copy of one state block whose only purpose was to be called from here. The two names are then chosen
@@ -3141,7 +3142,7 @@ namespace deren::vulkan {
          *        culled against the camera before it emits anything; optional, and the pass keeps the
          *        mesh form when it is empty
          * @return success, or an error message on failure
-         * @note the pipeline declares the three core::gbuffer_formats targets plus the depth format,
+         * @note the pipeline declares the three engine_device::gbuffer_formats targets plus the depth format,
          *       so it is only valid inside a rendering instance with exactly those attachments - the
          *       one set_gbuffer_debug() builds. Register it like any other pipeline (it is NOT the
          *       default: the G-buffer pass binds it explicitly).
@@ -3604,7 +3605,7 @@ namespace deren::vulkan {
          * §3.4 ruling is why it is a SHARED GLOBAL image rather than a `toon_slot` lane: the reference's FGD group
          * holds one `ShaderNodeTexImage`, three containers share that data-block, and the sample coordinate is
          * computed from shading parameters - so per-material lanes would be eleven rows of sidecar pointing at one
-         * file, i.e. the full lane cost for zero information. See `core::heap_slots::goo_fgd_lut`.
+         * file, i.e. the full lane cost for zero information. See `engine_device::heap_slots::goo_fgd_lut`.
          *
          * UNORM AND NOT `_SRGB`, which is the one thing about this upload that is easy to get wrong and changes the
          * picture rather than the format field: the data-block's `colorspace` is `'Non-Color'` (every other
@@ -3924,7 +3925,7 @@ namespace deren::vulkan {
      *        which only the GPU ever fills)
      * @note panics when the factory refuses - the same failure mode `init_utils::create_host_buffer` had
      */
-    void create_buffer(core& device, rhi::buffer_usage usage, rhi::buffer_flags flags, std::span<std::byte const> initial_bytes, std::string_view what, rhi::object_manager<rhi::buffer>& output, void** mapped);
+    void create_buffer(engine_device& device, rhi::buffer_usage usage, rhi::buffer_flags flags, std::span<std::byte const> initial_bytes, std::string_view what, rhi::object_manager<rhi::buffer>& output, void** mapped);
 
     /**
      * @brief the per-frame-slot form: create ONE buffer per frame slot of a shape the whole family shares,
@@ -3932,7 +3933,7 @@ namespace deren::vulkan {
      * @param outputs the family; APPENDED to (one handle per slot), so its size is the slot count on return
      * @param mapped the mappings to appends to; pass nullptr for a family the host never writes through
      */
-    void create_buffers(core& device, std::vector<rhi::object_manager<rhi::buffer>>& outputs, rhi::buffer_usage usage, rhi::buffer_flags flags, std::span<std::byte const> initial_bytes, std::string_view what, std::vector<void*>* mapped = nullptr);
+    void create_buffers(engine_device& device, std::vector<rhi::object_manager<rhi::buffer>>& outputs, rhi::buffer_usage usage, rhi::buffer_flags flags, std::span<std::byte const> initial_bytes, std::string_view what, std::vector<void*>* mapped = nullptr);
 
     /**
      * @brief THE DEVICE ADDRESS OF A CONTRACT BUFFER, through the `device_address` ability.
@@ -3940,5 +3941,5 @@ namespace deren::vulkan {
      *         `buffer_flag::device_address` - the ability's own two answers, and every call site here asks
      *         for a buffer it created WITH that flag.
      */
-    [[nodiscard]] VkDeviceAddress buffer_address(core& device, rhi::buffer const& buffer) noexcept;
+    [[nodiscard]] VkDeviceAddress buffer_address(engine_device& device, rhi::buffer const& buffer) noexcept;
 } // namespace deren::vulkan

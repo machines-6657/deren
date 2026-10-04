@@ -5,7 +5,7 @@
  * @brief The resolve: the render chain's display-referred LDR image onto the swapchain, by a linear filter.
  * @defgroup vulkan_pass_upscale Upscale Pass
  *
- * WHY IT EXISTS: `core::render_extent()` is the render chain's extent, and below `[render] render_scale = 1.0`
+ * WHY IT EXISTS: `engine_device::render_extent()` is the render chain's extent, and below `[render] render_scale = 1.0`
  * the whole chain is created smaller while the swapchain stays at the output size. Nothing resolved that
  * difference, so a scaled frame rendered into the TOP-LEFT QUADRANT of the presented image - the scene was
  * fully shaded, at a lower resolution, and the other three quarters held whatever the allocation had. This
@@ -54,7 +54,7 @@ export module deren.vulkan.pass.upscale;
 
 import deren.vulkan.pass;
 import deren.vulkan.render_resource;
-import deren.vulkan.core.handles; // vk_pipeline: the RAII owner of the pipeline this pass builds
+import deren.vulkan.engine_gpu; // vk_pipeline: the RAII owner of the pipeline this pass builds
 
 export namespace deren::vulkan::pass {
 

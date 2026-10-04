@@ -1036,11 +1036,12 @@ logical_device create_logical_device(
     device_creation_info const& create_info) noexcept {
     if (!create_info.queue_families.is_complete()) {
         deren::utility::error("Queue families not complete");
-        deren::utility::panic("Queue families not complete");
+        return {};
     }
 
     if (!create_info.queue_families.compute_family || !create_info.queue_families.graphics_family || !create_info.queue_families.present_family) {
-        deren::utility::panic("queue family is empty");
+        deren::utility::error("queue family is empty");
+        return {};
     }
 
     // Use a set to collect unique queue family indices
@@ -1113,7 +1114,8 @@ logical_device create_logical_device(
     VkDevice device = {};
     VkResult const result = vkCreateDevice(physical_device, &device_create_info, nullptr, &device);
     if (result != VK_SUCCESS) {
-        deren::utility::panic(std::source_location::current(), "Failed to create logical device: {}", std::to_string(result));
+        deren::utility::error("Failed to create logical device: VkResult {}", static_cast<int>(result));
+        return {};
     }
 
     // Get queues
@@ -1211,13 +1213,17 @@ queue_family_indices find_queue_families(VkPhysicalDevice device, VkSurfaceKHR s
 
 VkPhysicalDevice pick_suitable_device(VkInstance instance, VkSurfaceKHR surface) noexcept {
     uint32_t device_count = 0;
-    vkEnumeratePhysicalDevices(instance, &device_count, nullptr);
-    if (device_count == 0) {
-        deren::utility::panic("Failed to find GPUs with Vulkan support");
+    VkResult const enumeration = vkEnumeratePhysicalDevices(instance, &device_count, nullptr);
+    if (enumeration != VK_SUCCESS || device_count == 0) {
+        deren::utility::error("Failed to find GPUs with Vulkan support: VkResult {}", static_cast<int>(enumeration));
+        return VK_NULL_HANDLE;
     }
 
     std::vector<VkPhysicalDevice> devices(device_count);
-    vkEnumeratePhysicalDevices(instance, &device_count, devices.data());
+    if (vkEnumeratePhysicalDevices(instance, &device_count, devices.data()) != VK_SUCCESS) {
+        deren::utility::error("Physical device enumeration failed");
+        return VK_NULL_HANDLE;
+    }
 
     for (auto const& device : devices) {
         VkPhysicalDeviceProperties device_properties;
@@ -1257,7 +1263,8 @@ VkPhysicalDevice pick_suitable_device(VkInstance instance, VkSurfaceKHR surface)
         return device; // suitable device found
     }
 
-    deren::utility::panic("Failed to find a GPU satisfying renderer requirements; see per-device missing capabilities");
+    deren::utility::error("Failed to find a GPU satisfying renderer requirements; see per-device missing capabilities");
+    return VK_NULL_HANDLE;
 }
 
 swap_chain_support_details query_swap_chain_support(VkPhysicalDevice device, VkSurfaceKHR surface) noexcept {
@@ -1409,7 +1416,8 @@ VkFormat find_depth_format(VkPhysicalDevice physical_device) noexcept {
         }
     }
 
-    deren::utility::panic("failed to find supported depth format!");
+    deren::utility::error("failed to find supported depth format");
+    return VK_FORMAT_UNDEFINED;
 }
 
 VkImageView create_image_view(VkImage image, VkFormat format, VkImageAspectFlags aspect_flags, VkDevice device) noexcept {

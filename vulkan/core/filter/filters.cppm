@@ -10,7 +10,7 @@
  * swapchain, the allocator, every image and every descriptor pool. Handing that whole interface to a consumer
  * hands it the ability to do anything to the device, and the consumer then has no way to say what it actually
  * needs. A filter is a NAMED, narrow view of that root: the app gets one, a pass's init gets another, and each
- * can grow the operations its consumer is allowed to have. Both hold a `std::shared_ptr<core>`, so a filter can
+ * can grow the operations its consumer is allowed to have. Both hold a `std::shared_ptr<engine_device>`, so a filter can
  * outlive the object it was made from - which is what makes it usable as a member of something that shares a
  * device with a second owner.
  *
@@ -19,7 +19,7 @@
  *  * `user_filter` - what the RUNTIME exposes to the application through its `operator->`. It forwards the
  *    things external code may safely touch (the window, the swapchain's extent and format, the current frame,
  *    a command buffer, a shader module, a sampler) and NOTHING that manages the frame (acquire/submit/present
- *    stay the runtime's). It was called `core_filter` and took a `core&`; the rename is what makes room for a
+ *    stay the runtime's). It was called `core_filter` and took a `engine_device&`; the rename is what makes room for a
  *    family of filters rather than one.
  *
  *  * `pass_filter` - what a PASS's create step is given. It answers exactly the questions a pass cannot answer
@@ -47,7 +47,7 @@ module;
 
 export module deren.vulkan.core.filters;
 export import deren.vstd;
-export import deren.vulkan.core;
+export import deren.vulkan.engine_device;
 export import deren.vulkan.render_resource; // resource_id: what a pass asks for, in the declaration's own vocabulary
 
 export namespace deren::vulkan {
@@ -70,8 +70,8 @@ export namespace deren::vulkan {
      * @ingroup vulkan_core_filters
      * @brief filtered view over a core: what the APPLICATION may touch, exposed by `runtime::operator->`
      * @note
-     *      - holds a `std::shared_ptr<core>`, so it keeps the device alive while it exists
-     *      - the runtime exposes it via `operator->`, so external code never sees the raw core
+     *      - holds a `std::shared_ptr<engine_device>`, so it keeps the device alive while it exists
+     *      - the runtime exposes it via `operator->`, so external code never sees the raw engine_device
      *      - frame management (acquire/submit/present) and the core's own initialization are deliberately not
      *        forwarded: they belong to the runtime
      */
@@ -79,11 +79,11 @@ export namespace deren::vulkan {
         // called owner_share, not owner: the owner parameter of the constructor would hide a member of that name and
         // MSVC /W4 reports C4458, an error under /WX
         /// the share that keeps the device alive, and the raw pointer every method forwards through
-        std::shared_ptr<core> owner_share;
-        core* vk_core = nullptr;
+        std::shared_ptr<engine_device> owner_share;
+        engine_device* vk_core = nullptr;
 
     public:
-        explicit user_filter(std::shared_ptr<core> owner) noexcept;
+        explicit user_filter(std::shared_ptr<engine_device> owner) noexcept;
 
         // ---- read-only access to objects external code may safely touch ----
         [[nodiscard]] VkDevice get_device() const noexcept;
@@ -91,7 +91,7 @@ export namespace deren::vulkan {
         [[nodiscard]] VkExtent2D get_swap_chain_extent() const noexcept;
         [[nodiscard]] VkFormat get_swap_chain_image_format() const noexcept;
         [[nodiscard]] uint32_t get_current_frame() const noexcept;
-        static constexpr int32_t max_frames_in_flight = core::MAX_FRAMES_IN_FLIGHT;
+        static constexpr int32_t max_frames_in_flight = engine_device::MAX_FRAMES_IN_FLIGHT;
 
         // ---- facade operations (forwarded from core so callers need no raw API) ----
         void wait_idle() const noexcept;
@@ -114,7 +114,7 @@ export namespace deren::vulkan {
 
         // ---- swapchain handling ----
         /// @return true when a new generation was actually built; false when the recreate was deferred
-        ///         (0x0 window) and nothing died - see core::recreate_swap_chain's return value
+        ///         (0x0 window) and nothing died - see engine_device::recreate_swap_chain's return value
         [[nodiscard]] bool recreate_swap_chain() const;
     };
 
@@ -139,8 +139,8 @@ export namespace deren::vulkan {
         // called owner_share, not owner: the owner parameter of the constructor would hide a member of that name and
         // MSVC /W4 reports C4458, an error under /WX
         /// the share that keeps the device alive, and the raw pointer every method forwards through
-        std::shared_ptr<core> owner_share;
-        core* vk_core = nullptr;
+        std::shared_ptr<engine_device> owner_share;
+        engine_device* vk_core = nullptr;
         /**
          * What the OWNER (the runtime) has published for its passes to name.
          *
@@ -152,7 +152,7 @@ export namespace deren::vulkan {
         std::vector<std::pair<uint32_t, resource_handles>> registered;
 
     public:
-        explicit pass_filter(std::shared_ptr<core> owner) noexcept;
+        explicit pass_filter(std::shared_ptr<engine_device> owner) noexcept;
 
         /// @brief the device a pass builds its own objects on
         [[nodiscard]] VkDevice device() const noexcept;
@@ -167,7 +167,7 @@ export namespace deren::vulkan {
          *
          * The door rather than a wrapper per resource kind: a pass that creates GPU memory says so by asking
          * for the allocator, and the handles it gets back are RAII (`vk_buffer` / `vk_image` from
-         * `deren.vulkan.core:vma_handles`), so a pass's own resources are released by its own destructor in the order
+         * `deren.vulkan.engine_gpu_handles`), so a pass's own resources are released by its own destructor in the order
          * it wrote them. What the allocator does NOT do for a pass is decide the lifetime RULES: a per-generation
          * resource still has to be rebuilt in `on_swapchain_recreated`, and a descriptor family built over one
          * still has to retire its pool rather than destroy it (see `deren.vulkan.bindings`).

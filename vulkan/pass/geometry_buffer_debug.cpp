@@ -62,7 +62,7 @@ namespace deren::vulkan::pass {
             return;
         }
         // The debug view reads the stored surface through the frame's heap, so the pipeline is all it builds.
-        auto built = pipelines::build_gbuffer_debug(context.device, vertex_spirv, fragment_spirv);
+        auto built = pipelines::build_gbuffer_debug(context.gpu, vertex_spirv, fragment_spirv);
         if (!built) {
             deren::utility::log("gbuffer debug view disabled: {}", built.error());
             this->release_owned();

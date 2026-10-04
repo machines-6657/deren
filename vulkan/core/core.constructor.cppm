@@ -123,6 +123,9 @@ namespace {
             // GLFW on this path and never terminates it on any path.
             options.native_window = desc.native_window;
         }
+        if (deren::vulkan::covered_by(declared, offsetof(rhi_create_info, window_system), sizeof(rhi_create_info::window_system))) {
+            options.window_system = desc.window_system;
+        }
 
         return options;
     }
@@ -130,6 +133,11 @@ namespace {
 } // namespace
 
 namespace deren::vulkan {
+    void core::fail_initialization(deren::promise::rhi::error const reason, std::string_view const message) noexcept {
+        this->startup_error = reason;
+        this->initialized = false;
+        deren::utility::error("Vulkan backend initialization refused: {} (error {})", message, static_cast<std::uint32_t>(reason));
+    }
     // core
     core::core()
         : core(deren::promise::rhi::create_info{}) {
@@ -152,32 +160,51 @@ namespace deren::vulkan {
         if (this->render_scale != this->create_options.render_scale) {
             deren::utility::log("core: render_scale {} clamped to {} (the supported range is 0.1 .. 1.0)", this->create_options.render_scale, this->render_scale);
         }
-        if (this->create_options.native_window != nullptr) {
+        if (this->create_options.native_window != nullptr && this->create_options.window_system == deren::promise::rhi::window_system::glfw) {
             // caller-provided window: bind to it as-is - no glfwInit / glfwCreateWindow here and
             // no glfwDestroyWindow cleanup (ownership stays with the caller). The `void*` is the
             // backend's own reinterpretation of the contract's opaque handle.
             window = reinterpret_cast<GLFWwindow*>(this->create_options.native_window);
         } else {
-            // the title is read HERE and nowhere else: it is the contract's borrowed `char const*`
-            // and GLFW copies the text into the window during this call (the member note says so).
-            init_window(this->create_options.window_width, this->create_options.window_height,
-                        this->create_options.window_title != nullptr ? this->create_options.window_title : "");
+            this->fail_initialization(deren::promise::rhi::error::invalid_argument, "a caller-owned GLFW window and window_system::glfw are required");
+            return;
         }
         init_instance();
+        if (this->startup_error != deren::promise::rhi::error::ok)
+            return;
         init_surface();
+        if (this->startup_error != deren::promise::rhi::error::ok)
+            return;
         init_device_and_queue();
+        if (this->startup_error != deren::promise::rhi::error::ok)
+            return;
         init_swap_chain();
+        if (this->startup_error != deren::promise::rhi::error::ok)
+            return;
         init_image_views();
-        create_depth_resources();
+        if (this->startup_error != deren::promise::rhi::error::ok)
+            return;
+        this->depth_attachment_format = find_depth_format(this->physical_device);
+        if (this->depth_attachment_format == VK_FORMAT_UNDEFINED) {
+            this->fail_initialization(deren::promise::rhi::error::unsupported, "no depth attachment format is supported");
+            return;
+        }
         color_format = swap_chain_image_format;
-        create_render_targets(); // the scene's render targets: the post-process pass input
         create_command_pool();
-        create_samplers(); // the shared samplers a declaration picks by hint
+        if (this->startup_error != deren::promise::rhi::error::ok)
+            return;
         create_sync_objects();
+        if (this->startup_error != deren::promise::rhi::error::ok)
+            return;
         create_timestamp_query_pool(); // GPU pass timings (a no-op on devices that cannot timestamp)
 
         vma.init(this->instance, this->logical_device, this->physical_device, this->graphics_queue_handle, this->graphics_queue_family_index);
+        if (!this->vma.ready()) {
+            this->fail_initialization(deren::promise::rhi::error::resource_creation_failed, "VMA allocator initialization failed");
+            return;
+        }
         this->register_cleanup([this] {
+            this->descriptor_heaps.destroy();
             vma.destroy();
         });
 
@@ -248,28 +275,15 @@ namespace deren::vulkan {
                 this->heap_material_table_offset = this->descriptor_heaps.reserve(1u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
                 deren::utility::log("descriptor heap: layout reserved (texture array at {}, material table at {})", this->heap_texture_array_offset, this->heap_material_table_offset);
 
-                // THE SAMPLERS COME LAST BECAUSE THE HEAP DID NOT EXIST WHEN THEY WERE MADE: create_samplers()
-                // ran earlier in this constructor and kept the create infos (core.cppm's shared_sampler_infos),
-                // and a heap sampler descriptor IS such a create info - the driver creates the sampler inside the
-                // heap, exactly as it creates a view inside a heap image descriptor. Six of them, on the SAMPLER
-                // heap's own grid, in the order shaders/heap_slots.glsl names them.
-                if (descriptors_fit) {
-                    VkDeviceSize const sampler_grid = static_cast<VkDeviceSize>(heap_sampler_base) * heap_sampler_stride;
-                    uint32_t written = 0;
-                    for (uint32_t index = 0; index < this->shared_sampler_infos.size(); ++index) {
-                        VkSamplerCreateInfo const& info = this->shared_sampler_infos[index];
-                        if (info.sType != VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO) {
-                            continue; // a sampler that never got created is not written, and validation would say so
-                        }
-                        if (this->descriptor_heaps.write_samplers(sampler_grid + index * heap_sampler_stride, std::span<VkSamplerCreateInfo const>(&info, 1))) {
-                            ++written;
-                        }
-                    }
-                    deren::utility::log("descriptor heap: {} shared samplers written to the sampler grid at {}", written, sampler_grid);
-                }
+                // Engine writes its shared sampler descriptors after loading this backend.
             } else {
                 deren::utility::log("descriptor heap: not created; the heap is the only binding model this renderer has, so it cannot render without it");
             }
+        }
+
+        if (!this->descriptor_heaps.ready() || this->heap_grid_offset == VK_WHOLE_SIZE || this->heap_texture_array_offset == VK_WHOLE_SIZE || this->heap_material_table_offset == VK_WHOLE_SIZE) {
+            this->fail_initialization(deren::promise::rhi::error::resource_creation_failed, "descriptor heap or fixed slot grid initialization failed");
+            return;
         }
 
         // ---- S2 BATCH 2: THE CONTRACT'S VIEWS, THE FRAME'S COMMAND BUFFERS, THE READ-BACK RELEASE --
@@ -284,15 +298,6 @@ namespace deren::vulkan {
         this->readback_slot_view.owner = this;
         this->escape_view.owner = this;
         this->address_view.owner = this;
-        this->frame_command_buffers.reserve(static_cast<std::size_t>(MAX_FRAMES_IN_FLIGHT));
-        for (int32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
-            this->frame_command_buffers.push_back(this->make_command_buffer());
-        }
-        // THE VIEWS THAT OWN DEVICE MEMORY HAVE TO BE EMPTIED BEFORE THE DEVICE GOES AWAY, and that is
-        // what this cleanup is for: `vk_command_buffer` frees itself through the device and its pool,
-        // and `vk_buffer` through VMA's allocator - do_cleanup() destroys both from the destructor
-        // BODY, i.e. before any member destructor runs. do_cleanup() is LIFO and this is the LAST
-        // cleanup registered in this constructor, so it runs FIRST.
         this->register_cleanup([this] {
             this->frame_command_buffers.clear();
             this->readback_slot_buffer.reset();
@@ -300,6 +305,19 @@ namespace deren::vulkan {
             this->readback_slot_mapped = nullptr;
             this->readback_slot_size = 0;
         });
+        this->frame_command_buffers.reserve(static_cast<std::size_t>(MAX_FRAMES_IN_FLIGHT));
+        for (int32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
+            this->frame_command_buffers.push_back(this->make_command_buffer());
+            if (this->frame_command_buffers.back().get() == VK_NULL_HANDLE) {
+                this->fail_initialization(deren::promise::rhi::error::resource_creation_failed, "primary command buffer allocation failed");
+                return;
+            }
+        }
+        // THE VIEWS THAT OWN DEVICE MEMORY HAVE TO BE EMPTIED BEFORE THE DEVICE GOES AWAY, and that is
+        // what this cleanup is for: `vk_command_buffer` frees itself through the device and its pool,
+        // and `vk_buffer` through VMA's allocator - do_cleanup() destroys both from the destructor
+        // BODY, i.e. before any member destructor runs. do_cleanup() is LIFO and this is the LAST
+        // cleanup registered in this constructor, so it runs FIRST.
         // ---- THE ABILITY INVARIANT, CHECKED AT STARTUP (batch-1 spec §4.3, gate G2) -----------------
         // `abilities()` may only report a bit whose `query_extension()` answers with an object of that
         // kind: "reported but not retrievable" and "retrievable but not reported" are both backend bugs,
@@ -320,10 +338,12 @@ namespace deren::vulkan {
                 deren::utility::panic("rhi: abilities()/query_extension() are inconsistent");
             }
         }
+        this->initialized = true;
     };
 
     core::~core() {
-        vkDeviceWaitIdle(this->logical_device);
+        if (this->logical_device != VK_NULL_HANDLE)
+            vkDeviceWaitIdle(this->logical_device);
         this->do_cleanup();
     }
 
@@ -397,6 +417,10 @@ namespace deren::vulkan {
         // get and set GLFW required extensions
         uint32_t glfw_extension_count = 0;
         char const** glfw_extensions = glfwGetRequiredInstanceExtensions(&glfw_extension_count);
+        if (glfw_extensions == nullptr || glfw_extension_count == 0) {
+            this->fail_initialization(deren::promise::rhi::error::unsupported, "GLFW cannot obtain Vulkan instance extensions");
+            return;
+        }
 
         std::vector<char const*> extensions(glfw_extensions, glfw_extensions + glfw_extension_count);
 
@@ -474,7 +498,8 @@ namespace deren::vulkan {
                 error_msg += std::to_string(static_cast<int32_t>(result));
                 break;
             }
-            deren::utility::panic(error_msg);
+            this->fail_initialization(deren::promise::rhi::error::instance_creation_failed, error_msg);
+            return;
         }
         deren::utility::log("instance init succeeded");
         deren::utility::log("instance handler is 0x{:x}", reinterpret_cast<uint64_t>(this->instance));
@@ -494,7 +519,8 @@ namespace deren::vulkan {
                 instance, "vkDestroyDebugUtilsMessengerEXT"));
 
             if ((vkCreateDebugUtilsMessengerEXT == nullptr) || (vkDestroyDebugUtilsMessengerEXT == nullptr)) {
-                deren::utility::panic("Failed to get debug utils function pointers");
+                this->fail_initialization(deren::promise::rhi::error::unsupported, "Failed to get debug utils function pointers");
+                return;
             }
             VkDebugUtilsMessengerCreateInfoEXT debug_info = {};
             debug_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
@@ -511,7 +537,8 @@ namespace deren::vulkan {
             debug_info.pUserData = nullptr;
 
             if (vkCreateDebugUtilsMessengerEXT(instance, &debug_info, nullptr, &debug_messenger) != VK_SUCCESS) {
-                deren::utility::error("create debug messenger failed");
+                this->fail_initialization(deren::promise::rhi::error::resource_creation_failed, "create debug messenger failed");
+                return;
             } else {
                 deren::utility::log("create debug messenger succeeded");
             }
@@ -523,7 +550,8 @@ namespace deren::vulkan {
 
     void core::init_surface() noexcept {
         if (glfwCreateWindowSurface(this->instance, this->window, nullptr, &this->surface) != VK_SUCCESS) {
-            deren::utility::panic("can not init surface");
+            this->fail_initialization(deren::promise::rhi::error::surface_creation_failed, "glfwCreateWindowSurface failed");
+            return;
         }
 
         this->register_cleanup([this] {
@@ -533,6 +561,10 @@ namespace deren::vulkan {
 
     void core::init_device_and_queue() noexcept {
         this->physical_device = pick_suitable_device(this->instance, this->surface);
+        if (this->physical_device == VK_NULL_HANDLE) {
+            this->fail_initialization(deren::promise::rhi::error::unsupported, "no GPU satisfies renderer requirements; see per-device missing capabilities");
+            return;
+        }
 
         // Collect device capabilities: one query through the feature/property pNext chains (see device_capabilities)
         device_capabilities capabilities;
@@ -548,7 +580,8 @@ namespace deren::vulkan {
             for (char const* requirement : missing) {
                 deren::utility::error("Selected GPU is missing required capability: {}", requirement);
             }
-            deren::utility::panic("Selected GPU no longer satisfies renderer requirements");
+            this->fail_initialization(deren::promise::rhi::error::unsupported, "Selected GPU no longer satisfies renderer requirements");
+            return;
         }
 
         device_creation_info creation_info;
@@ -632,7 +665,8 @@ namespace deren::vulkan {
         creation_info.extensions.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
 
         if (!check_device_extension_support(physical_device, creation_info.extensions)) {
-            deren::utility::panic("Required device extensions not supported");
+            this->fail_initialization(deren::promise::rhi::error::unsupported, "Required device extensions not supported");
+            return;
         }
 
         // Features go through the pNext chain (device_capabilities query result, incl. all 1.1/1.2/1.3 supported features)
@@ -645,6 +679,14 @@ namespace deren::vulkan {
         auto const [device, graphics_family_index, present_family_index, graphics_queue, present_queue] = create_logical_device(physical_device, creation_info); // NOLINT(*-misplaced-const)
 
         this->logical_device = device;
+        if (device == VK_NULL_HANDLE) {
+            this->fail_initialization(deren::promise::rhi::error::device_creation_failed, "vkCreateDevice failed");
+            return;
+        }
+        register_cleanup([this] {
+            if (this->logical_device != VK_NULL_HANDLE)
+                vkDestroyDevice(this->logical_device, nullptr);
+        });
 
         // ---- MESH SHADERS: the capability half (docs/mesh_shaders.md). The extension is enabled above only when
         //      the feature is there, so `mesh_shader_available` and "the feature struct is in the device chain" are
@@ -670,10 +712,12 @@ namespace deren::vulkan {
         this->copy_image_to_memory = reinterpret_cast<PFN_vkCopyImageToMemoryEXT>(vkGetDeviceProcAddr(device, "vkCopyImageToMemoryEXT"));
         this->copy_memory_to_image = reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(vkGetDeviceProcAddr(device, "vkCopyMemoryToImageEXT"));
         if (this->copy_image_to_memory == nullptr) {
-            deren::utility::panic("VK_EXT_host_image_copy is enabled but vkCopyImageToMemoryEXT did not resolve through vkGetDeviceProcAddr");
+            this->fail_initialization(deren::promise::rhi::error::unsupported, "VK_EXT_host_image_copy enabled but vkCopyImageToMemoryEXT did not resolve");
+            return;
         }
         if (this->copy_memory_to_image == nullptr) {
-            deren::utility::panic("VK_EXT_host_image_copy is enabled but vkCopyMemoryToImageEXT did not resolve through vkGetDeviceProcAddr");
+            this->fail_initialization(deren::promise::rhi::error::unsupported, "VK_EXT_host_image_copy enabled but vkCopyMemoryToImageEXT did not resolve");
+            return;
         }
         // ... and the allocator gets it, because THE IMAGE UPLOAD IS THAT CALL: vma.cppm's
         // host_image_upload() copies each mip from the caller's memory into the image with it (the image
@@ -717,12 +761,6 @@ namespace deren::vulkan {
         this->ray_tracing_pipeline_properties = capabilities.ray_tracing_pipeline_properties;
 
         deren::utility::log("device and queue init succeeded");
-
-        register_cleanup([this] {
-            if (this->logical_device != VK_NULL_HANDLE) {
-                vkDestroyDevice(this->logical_device, nullptr);
-            }
-        });
     }
 
     void core::init_swap_chain() noexcept {
@@ -730,7 +768,8 @@ namespace deren::vulkan {
 
         // Add checks:
         if (formats.empty() || present_modes.empty()) {
-            deren::utility::panic("Swap chain not adequately supported");
+            this->fail_initialization(deren::promise::rhi::error::unsupported, "Swap chain not adequately supported");
+            return;
         }
 
         auto const [format, color_space] = choose_swap_surface_format(formats);
@@ -805,7 +844,8 @@ namespace deren::vulkan {
 
         queue_family_indices const indices = find_queue_families(this->physical_device, this->surface);
         if (!indices.compute_family || !indices.graphics_family || !indices.present_family) {
-            deren::utility::panic("find queue family index failed");
+            this->fail_initialization(deren::promise::rhi::error::unsupported, "find queue family index failed");
+            return;
         }
 
         uint32_t const queue_family_indices[] = {indices.graphics_family.value(), indices.present_family.value()};
@@ -827,7 +867,8 @@ namespace deren::vulkan {
         create_info.oldSwapchain = VK_NULL_HANDLE;
 
         if (vkCreateSwapchainKHR(logical_device, &create_info, nullptr, &this->swap_chain) != VK_SUCCESS) {
-            deren::utility::panic("failed to create swap chain!");
+            this->fail_initialization(deren::promise::rhi::error::swapchain_creation_failed, "vkCreateSwapchainKHR failed");
+            return;
         }
 
         vkGetSwapchainImagesKHR(logical_device, this->swap_chain, &image_count, nullptr);
@@ -846,20 +887,19 @@ namespace deren::vulkan {
     }
 
     void core::init_image_views() noexcept {
-
+        register_cleanup([this] {
+            for (auto const& image_view : this->swap_chain_image_views)
+                vkDestroyImageView(logical_device, image_view, nullptr);
+            this->swap_chain_image_views.clear();
+        });
         this->swap_chain_image_views.resize(this->swap_chain_images.size());
         for (size_t i = 0; i < this->swap_chain_images.size(); i++) {
             VkImageViewCreateInfo const create_info = make_image_view_info(this->swap_chain_images[i], swap_chain_image_format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
             if (vkCreateImageView(logical_device, &create_info, nullptr, &this->swap_chain_image_views[i]) != VK_SUCCESS) {
-                deren::utility::panic("failed to create image views!");
+                this->fail_initialization(deren::promise::rhi::error::resource_creation_failed, "swapchain image view creation failed");
+                return;
             }
         }
-        register_cleanup([this] {
-            for (auto const& image_view : this->swap_chain_image_views) {
-                vkDestroyImageView(logical_device, image_view, nullptr);
-            }
-            this->swap_chain_image_views.clear();
-        });
     }
 
     void core::create_depth_image(VkImage& image, VkDeviceMemory& image_memory, VkImageView& image_view) const noexcept {
@@ -1462,7 +1502,8 @@ namespace deren::vulkan {
         VkCommandPoolCreateInfo const pool_info = make_command_pool_info(graphics_queue_family_index);
 
         if (vkCreateCommandPool(logical_device, &pool_info, nullptr, &command_pool) != VK_SUCCESS) {
-            deren::utility::panic("failed to create command pool");
+            this->fail_initialization(deren::promise::rhi::error::resource_creation_failed, "vkCreateCommandPool failed");
+            return;
         }
 
         register_cleanup([this] {
@@ -1623,36 +1664,39 @@ namespace deren::vulkan {
         frame_done_semaphores.resize(MAX_FRAMES_IN_FLIGHT);
         frame_done_values.assign(MAX_FRAMES_IN_FLIGHT, 0);
 
+        register_cleanup([this] {
+            for (auto const semaphore : image_available_semaphores)
+                vkDestroySemaphore(logical_device, semaphore, nullptr);
+            for (auto const semaphore : present_ready_semaphores)
+                vkDestroySemaphore(logical_device, semaphore, nullptr);
+            for (auto const semaphore : frame_done_semaphores)
+                vkDestroySemaphore(logical_device, semaphore, nullptr);
+            image_available_semaphores.clear();
+            present_ready_semaphores.clear();
+            frame_done_semaphores.clear();
+        });
+
         VkSemaphoreTypeCreateInfo timeline_type = make_timeline_semaphore_type_info();
         VkSemaphoreCreateInfo binary_info = make_binary_semaphore_info();
 
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
             if (vkCreateSemaphore(logical_device, &binary_info, nullptr, &image_available_semaphores[i]) != VK_SUCCESS) {
-                deren::utility::panic("failed to create image-available semaphore");
+                this->fail_initialization(deren::promise::rhi::error::resource_creation_failed, "image-available semaphore creation failed");
+                return;
             }
             VkSemaphoreCreateInfo timeline_info = binary_info;
             timeline_info.pNext = &timeline_type;
             if (vkCreateSemaphore(logical_device, &timeline_info, nullptr, &frame_done_semaphores[i]) != VK_SUCCESS) {
-                deren::utility::panic("failed to create frame-done timeline semaphore");
+                this->fail_initialization(deren::promise::rhi::error::resource_creation_failed, "frame-done timeline semaphore creation failed");
+                return;
             }
         }
         for (auto& semaphore : present_ready_semaphores) {
             if (vkCreateSemaphore(logical_device, &binary_info, nullptr, &semaphore) != VK_SUCCESS) {
-                deren::utility::panic("failed to create present-ready semaphore");
+                this->fail_initialization(deren::promise::rhi::error::resource_creation_failed, "present-ready semaphore creation failed");
+                return;
             }
         }
-
-        register_cleanup([this] {
-            for (auto const& semaphore : image_available_semaphores) {
-                vkDestroySemaphore(logical_device, semaphore, nullptr);
-            }
-            for (auto const& semaphore : present_ready_semaphores) {
-                vkDestroySemaphore(logical_device, semaphore, nullptr);
-            }
-            for (auto const& semaphore : frame_done_semaphores) {
-                vkDestroySemaphore(logical_device, semaphore, nullptr);
-            }
-        });
     }
 
     void core::create_timestamp_query_pool() noexcept {

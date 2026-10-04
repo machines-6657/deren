@@ -41,6 +41,7 @@ module;
 #include <vulkan/vulkan.h>
 
 export module deren.vulkan.pass;
+export import deren.vulkan.engine_gpu;
 
 import deren.vulkan.render_resource;
 import deren.vulkan.render_resource.shared;
@@ -403,6 +404,7 @@ export namespace deren::vulkan::pass {
      */
     struct pass_context {
         /// the device a pass builds its own objects on (the owner fills this from the filtered core view)
+        gpu_context gpu = {};
         VkDevice device = VK_NULL_HANDLE;
         render_resource::shared::sampler_set samplers = {};
         /**

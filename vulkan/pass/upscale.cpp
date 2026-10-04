@@ -63,7 +63,7 @@ namespace deren::vulkan::pass {
             return;
         }
         // The surface's format is the pipeline's declared colour format (the resolve writes the swapchain).
-        auto built = pipelines::build_upscale_owned(context.device, context.swap_chain_image_format, vertex_spirv, fragment_spirv);
+        auto built = pipelines::build_upscale_owned(context.gpu, context.swap_chain_image_format, vertex_spirv, fragment_spirv);
         if (!built) {
             deren::utility::log("upscale disabled: {}", built.error());
             this->release_owned();
@@ -107,7 +107,7 @@ namespace deren::vulkan::pass {
         //
         // THE ZERO GUARDS ARE NOT DEFENSIVE PADDING: these are divisions by an extent, and a zero would put an
         // infinity into EASU's tap positions, which produces a frame of garbage rather than a small image. The
-        // frame cannot reach here with a zero extent (the pass returns early, and `core::render_extent` clamps
+        // frame cannot reach here with a zero extent (the pass returns early, and `engine_device::render_extent` clamps
         // to 1), so the guard exists to make that a property of THIS function rather than of its callers.
         float const in_w = static_cast<float>(render_width == 0u ? 1u : render_width);
         float const in_h = static_cast<float>(render_height == 0u ? 1u : render_height);

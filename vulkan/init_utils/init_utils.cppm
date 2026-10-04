@@ -40,7 +40,7 @@ module;
 export module deren.vulkan.init_utils;
 
 export import deren.vstd;
-export import deren.vulkan.core; // the vma handles + the vk_* wrappers this interface names
+export import deren.vulkan.engine_device; // the vma handles + the vk_* wrappers this interface names
 
 /**
  * @file vulkan/init_utils/init_utils.cppm
@@ -62,7 +62,7 @@ export import deren.vulkan.core; // the vma handles + the vk_* wrappers this int
  *       two `create_image` span templates are additionally unusable as written: they forward
  *       `(data, create_info, size, type)` to an overload declared `(data, size, create_info, type)`, so
  *       instantiating either one is a compile error. Recorded rather than fixed here, because that fix
- *       belongs to deren.vulkan.core:vma and not to this module.)
+ *       belongs to deren.vulkan.engine_gpu and not to this module.)
  */
 namespace deren::vulkan::init_utils {
     /**
@@ -91,7 +91,7 @@ namespace deren::vulkan::init_utils {
      * @note panics (with @p what in the message) when the buffer cannot be created or its detail cannot
      *       be looked up - the failure mode the call sites all handled by hand before
      */
-    export void create_host_buffer(core& device,
+    export void create_host_buffer(engine_device& device,
                                    std::span<std::byte const> initial,
                                    buffer_type type,
                                    std::string_view what,
@@ -107,7 +107,7 @@ namespace deren::vulkan::init_utils {
      * @brief create @p slots host-visible buffers of the same shape (one per frame slot) and collect
      *        their mapped pointers beside them
      * @param device the core whose vma allocator creates them
-     * @param slots how many to create (the runtime passes core::MAX_FRAMES_IN_FLIGHT)
+     * @param slots how many to create (the runtime passes engine_device::MAX_FRAMES_IN_FLIGHT)
      * @param initial the bytes each one starts with
      * @param type the buffer's usage/memory type
      * @param what what the resource is called in the failure log
@@ -118,7 +118,7 @@ namespace deren::vulkan::init_utils {
      *       frame rewrites), which is why the helper takes the slot count rather than being called in a
      *       loop by every caller
      */
-    export void create_host_buffers(core& device,
+    export void create_host_buffers(engine_device& device,
                                     uint32_t slots,
                                     std::span<std::byte const> initial,
                                     buffer_type type,
@@ -136,7 +136,7 @@ namespace deren::vulkan::init_utils {
      * @note one pool PER consumer, never a shared one: a VkCommandPool is not thread safe and these
      *       buffers are filled concurrently (see the recording stages' notes in deren.vulkan.runtime)
      */
-    export [[nodiscard]] std::pair<VkCommandPool, vk_command_buffer> create_recording_pool(core& device);
+    export [[nodiscard]] std::pair<VkCommandPool, vk_command_buffer> create_recording_pool(engine_device& device);
 
     /**
      * @ingroup vulkan_init_utils_runtime
@@ -161,7 +161,7 @@ namespace deren::vulkan::init_utils {
      * @note panics (with @p what in the message) when the image cannot be created or its detail cannot
      *       be looked up
      */
-    export [[nodiscard]] texture_2d create_texture_2d(core& device,
+    export [[nodiscard]] texture_2d create_texture_2d(engine_device& device,
                                                       std::span<std::byte const> pixels,
                                                       image_create_info const& info,
                                                       std::string_view what);

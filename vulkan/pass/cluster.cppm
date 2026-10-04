@@ -8,7 +8,7 @@
  *
  * WHAT IT OWNS: its pipeline layout and its compute pipeline (built at create time from the shared scene block
  * layout and its own shader - the first compute pipeline in this tree that came out of `deren.vulkan.core`, where
- * `core::make_cluster_pipeline` built it against the core's own scene pipeline layout); the bind of the shared
+ * `engine_device::make_cluster_pipeline` built it against the core's own scene pipeline layout); the bind of the shared
  * scene set; the one-dimensional dispatch over the cluster grid; and the TWO BUFFER BARRIERS that make its
  * writes visible to the fragment stages reading them later in the same submission. That last part is why the
  * framework grew `pass_io::barrier_buffers` in the same step - see the header of `deren.vulkan.pass`'s
@@ -38,7 +38,7 @@ export module deren.vulkan.pass.cluster;
 
 import deren.vulkan.pass;
 import deren.vulkan.render_resource;
-import deren.vulkan.core.handles; // vk_pipeline: the RAII owner of the compute pipeline this pass builds
+import deren.vulkan.engine_gpu; // vk_pipeline: the RAII owner of the compute pipeline this pass builds
 
 export namespace deren::vulkan::pass {
 

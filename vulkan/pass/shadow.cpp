@@ -80,7 +80,7 @@ namespace deren::vulkan::pass {
         // IT IS THE MESH FORM THAT IS BUILT FIRST NOW, and it is required: with the vertex form gone this pass cannot
         // draw its casters any other way, so a refusal is a DISABLED PASS rather than a fallback - visible as a
         // missing shadow rather than as a wrong picture, and named in the log.
-        auto mesh_built = pipelines::build_shadow(context.device, context.depth_format, create_bias_constant, create_bias_slope, create_bias_clamp, mesh_spirv, fragment_spirv, VK_SHADER_STAGE_MESH_BIT_EXT);
+        auto mesh_built = pipelines::build_shadow(context.gpu, context.depth_format, create_bias_constant, create_bias_slope, create_bias_clamp, mesh_spirv, fragment_spirv, VK_SHADER_STAGE_MESH_BIT_EXT);
         if (!mesh_built) {
             deren::utility::log("shadow disabled: the mesh pipeline was refused ({})", mesh_built.error());
             this->release_owned();
@@ -92,7 +92,7 @@ namespace deren::vulkan::pass {
         // stage), and a missing shader or a refusal is a log line - the mesh form above is a complete answer.
         std::span<uint8_t const> const meshlet_spirv = context.shader != nullptr ? context.shader(context.owner, meshlet_shader_name) : std::span<uint8_t const>{};
         if (!meshlet_spirv.empty()) {
-            auto meshlet_built = pipelines::build_shadow(context.device, context.depth_format, create_bias_constant, create_bias_slope, create_bias_clamp, meshlet_spirv, fragment_spirv, VK_SHADER_STAGE_MESH_BIT_EXT);
+            auto meshlet_built = pipelines::build_shadow(context.gpu, context.depth_format, create_bias_constant, create_bias_slope, create_bias_clamp, meshlet_spirv, fragment_spirv, VK_SHADER_STAGE_MESH_BIT_EXT);
             if (meshlet_built) {
                 this->meshlet_pipeline = std::move(*meshlet_built);
                 deren::utility::log("SUCCESS: shadow MESHLET pipeline created (one workgroup per meshlet, window read from the table)");

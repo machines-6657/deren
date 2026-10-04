@@ -20,7 +20,7 @@ namespace deren::vulkan {
     // the application's view
     // =============================================================================================
 
-    user_filter::user_filter(std::shared_ptr<core> owner) noexcept
+    user_filter::user_filter(std::shared_ptr<engine_device> owner) noexcept
         : owner_share(std::move(owner))
         , vk_core(this->owner_share.get()) {
     }
@@ -85,7 +85,7 @@ namespace deren::vulkan {
     // resources the owner published - nothing that manages a frame, and no per-generation handle
     // =============================================================================================
 
-    pass_filter::pass_filter(std::shared_ptr<core> owner) noexcept
+    pass_filter::pass_filter(std::shared_ptr<engine_device> owner) noexcept
         : owner_share(std::move(owner))
         , vk_core(this->owner_share.get()) {
     }
